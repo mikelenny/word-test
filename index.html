@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>词听 · 离线单词听写</title>
+  <meta name="description" content="完全离线的英语单词听写工具：高考、雅思、四级、考研词库，看中文写英文、看英文选中文。">
+  <meta name="theme-color" content="#f4efe3">
+  <meta name="color-scheme" content="light">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="词听">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/favicon-64.png" sizes="64x64" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app-shell" id="app">
+    <div class="splash" id="splash">
+      <img src="icons/icon-192.png" alt="" width="76" height="76">
+      <div class="splash-brand">词听</div>
+      <p id="splashText">正在准备离线词库…</p>
+    </div>
+
+    <header class="topbar" id="topbar" hidden>
+      <div class="brand">
+        <button class="brand-mark" id="brandHome" aria-label="回到学习首页">词</button>
+        <div class="brand-copy">
+          <h1 id="pageTitle">词听</h1>
+          <p id="pageSub">离线单词听写</p>
+        </div>
+      </div>
+      <button class="icon-btn" id="topAction" aria-label="设置"></button>
+    </header>
+
+    <main class="view" id="view" hidden></main>
+
+    <nav class="tabbar" id="tabbar" aria-label="主导航" hidden>
+      <button class="tab is-active" data-tab="home">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1z"/></svg>
+        <span>学习</span>
+      </button>
+      <button class="tab" data-tab="wrong">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h9l4 4v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z"/><path d="M14 4v5h5M8.5 13h7M8.5 17h5"/></svg>
+        <span>错词</span>
+        <i class="tab-dot" id="wrongDot" hidden></i>
+      </button>
+      <button class="tab" data-tab="stats">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7"/><path d="M3 20h18"/></svg>
+        <span>记录</span>
+      </button>
+      <button class="tab" data-tab="settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21h-4v-.05A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3v-4h.05A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3h4v.05A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 1.55 1H21v4h-.05a1.7 1.7 0 0 0-1.55 1Z"/></svg>
+        <span>我的</span>
+      </button>
+    </nav>
+  </div>
+
+  <section class="session" id="session" hidden aria-label="单词练习">
+    <header class="session-top">
+      <button class="icon-btn session-close" id="sessionClose" aria-label="退出练习">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+      <div class="session-progress">
+        <div class="session-meta"><span id="sessionBook">练习</span><span id="sessionCount">0 / 0</span></div>
+        <div class="progress-track"><i id="sessionBar"></i></div>
+      </div>
+      <div class="session-score"><strong id="sessionScore">0</strong><span>分</span></div>
+    </header>
+    <main class="session-body" id="sessionBody"></main>
+  </section>
+
+  <div class="backdrop" id="backdrop" hidden></div>
+  <section class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" hidden>
+    <div class="sheet-grip" aria-hidden="true"></div>
+    <div class="sheet-content" id="sheetContent"></div>
+  </section>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <noscript>
+    <div class="noscript">词听需要启用 JavaScript 才能运行。</div>
+  </noscript>
+
+  <script src="js/app.js" defer></script>
+</body>
+</html>

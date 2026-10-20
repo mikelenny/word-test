@@ -1,0 +1,48 @@
+{
+  "id": "./",
+  "name": "词听 · 离线单词听写",
+  "short_name": "词听",
+  "description": "完全离线的英语单词听写工具：高考、雅思、四级、考研词库，看中文写英文、看英文选中文。",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#f4efe3",
+  "theme_color": "#f4efe3",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "看中文写英文",
+      "short_name": "写英文",
+      "url": "./?mode=zh2en",
+      "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "看英文选中文",
+      "short_name": "选中文",
+      "url": "./?mode=en2zh",
+      "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}
