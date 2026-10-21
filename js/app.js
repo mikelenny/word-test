@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.2.0";
+  const APP_VERSION = "1.3.3";
   const STORAGE_KEY = "citing.state.v1";
   const DAY = 24 * 60 * 60 * 1000;
   const REVIEW_DAYS = [0, 1, 2, 4, 7, 15, 30];
@@ -90,6 +90,7 @@
     books: {},
     dict: null,
     dictPromise: null,
+    bookPromises: {},
   };
 
   const ui = {
@@ -100,6 +101,12 @@
     lookupToken: 0,
     deferredPrompt: null,
     swReady: false,
+    offlineReady: false,
+    offlineProgress: 0,
+    offlineTotal: 6,
+    bookLoading: false,
+    bookError: "",
+    bookPromise: null,
     sentenceSeed: 0,
     lastFocus: null,
   };
@@ -413,6 +420,8 @@
       settings.accent = settings.accent === "uk" ? "uk" : "us";
       settings.order = settings.order === "sequence" ? "sequence" : "random";
       settings.sound = settings.sound !== false;
+      if (typeof settings.softKeyboard !== "boolean") settings.softKeyboard = isTouchDevice();
+      settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
       settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
       return {
         version: 1,
@@ -440,6 +449,8 @@
         autoSpeak: false,
         order: "random",
         sound: true,
+        softKeyboard: isTouchDevice(),
+        soundVolume: 1.5,
         ranges: {},
         installHintDismissed: false,
       },
@@ -675,14 +686,38 @@
   }
 
   /* ---------------- data ---------------- */
-  async function fetchJSON(path) {
-    const response = await fetch(path, { cache: "no-cache" });
-    if (!response.ok) throw new Error(`${response.status} ${path}`);
-    return response.json();
+  function wait(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function fetchJSON(path, options = {}) {
+    const attempts = options.attempts || 3;
+    const timeout = options.timeout || 20000;
+    let lastError = new Error(`加载失败：${path}`);
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = controller ? window.setTimeout(() => controller.abort(), timeout) : 0;
+      try {
+        // 重试时加时间戳，绕过可能已经损坏的 HTTP / Service Worker 缓存。
+        const url = attempt === 0 ? path : `${path}${path.includes("?") ? "&" : "?"}retry=${Date.now()}`;
+        const response = await fetch(url, {
+          cache: "no-cache",
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!response.ok) throw new Error(`${response.status} ${path}`);
+        return await response.json();
+      } catch (error) {
+        lastError = error;
+        if (attempt < attempts - 1) await wait(700 * (attempt + 1));
+      } finally {
+        if (timer) window.clearTimeout(timer);
+      }
+    }
+    throw lastError;
   }
 
   async function loadMeta() {
-    state.meta = await fetchJSON("data/meta.json");
+    state.meta = await fetchJSON("data/meta.json", { timeout: 12000, attempts: 3 });
     if (!state.meta || !Array.isArray(state.meta.books) || !state.meta.books.length) {
       throw new Error("词库元数据无效");
     }
@@ -692,7 +727,7 @@
     if (state.books[id]) return state.books[id];
     const meta = state.meta.books.find((book) => book.id === id);
     if (!meta) throw new Error("没有找到这个词库");
-    const data = await fetchJSON(`data/books/${id}.json`);
+    const data = await fetchJSON(`data/books/${id}.json`, { timeout: 30000, attempts: 3 });
     if (!data || !Array.isArray(data.words) || !data.words.length) {
       throw new Error("词库内容为空");
     }
@@ -703,6 +738,45 @@
     data._examples = data.words.filter((entry) => entry.e && entry.t);
     state.books[id] = data;
     return data;
+  }
+
+  function ensureBook(id) {
+    if (state.books[id]) return Promise.resolve(state.books[id]);
+    if (!state.bookPromises[id]) {
+      state.bookPromises[id] = loadBook(id).finally(() => {
+        delete state.bookPromises[id];
+      });
+    }
+    return state.bookPromises[id];
+  }
+
+  function ensureCurrentBook() {
+    const id = store.settings.bookId;
+    if (state.books[id]) return Promise.resolve(state.books[id]);
+    if (state.bookPromises[id]) return state.bookPromises[id];
+    ui.bookLoading = true;
+    ui.bookError = "";
+    renderCurrent();
+    const promise = ensureBook(id)
+      .then((book) => {
+        ui.bookLoading = false;
+        ui.bookError = "";
+        if (store.settings.bookId === id) {
+          renderCurrent();
+          prewarmRelations(book);
+        }
+        return book;
+      })
+      .catch((error) => {
+        ui.bookLoading = false;
+        ui.bookError = error && error.message ? error.message : "词库加载失败";
+        renderCurrent();
+        throw error;
+      })
+      .finally(() => {
+        ui.bookLoading = false;
+      });
+    return promise;
   }
 
   async function loadDict() {
@@ -758,18 +832,24 @@
   /* ---------------- audio ---------------- */
   let voices = [];
   let voicesLoaded = false;
+  let speechErrorShown = false;
 
   function loadVoices() {
     if (!("speechSynthesis" in window)) return;
-    voices = window.speechSynthesis.getVoices() || [];
-    if (voices.length) voicesLoaded = true;
+    try {
+      voices = window.speechSynthesis.getVoices() || [];
+      if (voices.length) voicesLoaded = true;
+    } catch (error) {
+      voices = [];
+    }
   }
 
   if ("speechSynthesis" in window) {
     loadVoices();
-    window.speechSynthesis.addEventListener("voiceschanged", loadVoices);
-    setTimeout(loadVoices, 350);
-    setTimeout(loadVoices, 1200);
+    // Safari 早期版本只支持 onvoiceschanged，同时保留 addEventListener 兼容。
+    try { window.speechSynthesis.addEventListener("voiceschanged", loadVoices); } catch (error) { /* ignore */ }
+    try { window.speechSynthesis.onvoiceschanged = loadVoices; } catch (error) { /* ignore */ }
+    [0, 250, 800, 1800, 3500, 6000].forEach((delay) => setTimeout(loadVoices, delay));
   }
 
   function speak(text, options = {}) {
@@ -786,17 +866,26 @@
       utterance.lang = accent;
       utterance.rate = options.rate || 0.88;
       utterance.pitch = 1;
-      const exact = voices.filter((voice) => voice.lang === accent);
-      const english = voices.filter((voice) => /^en[-_]/i.test(voice.lang));
+      utterance.volume = 1;
+      const normalizedAccent = accent.toLowerCase();
+      const exact = voices.filter((voice) => String(voice.lang || "").toLowerCase().replace("_", "-") === normalizedAccent);
+      const english = voices.filter((voice) => /^en[-_]/i.test(String(voice.lang || "")));
       const voice = exact.find((item) => item.localService) || exact[0] || english.find((item) => item.localService) || english[0];
       if (voice) utterance.voice = voice;
+      utterance.onerror = (event) => {
+        const reason = event && event.error ? event.error : "unknown";
+        // 自动发音不是用户手势，Safari 会返回 not-allowed；不要因此误报“没有语音包”。
+        if (reason === "canceled" || reason === "interrupted" || reason === "not-allowed") return;
+        console.warn("Speech error", reason);
+        if (!speechErrorShown) {
+          speechErrorShown = true;
+          toast("语音没有播放出来：请检查媒体音量，或在系统设置中安装英语语音", true);
+        }
+      };
       window.speechSynthesis.speak(utterance);
-      if (!voices.length) {
-        setTimeout(() => {
-          loadVoices();
-          if (!voices.length) toast("没有检测到英语语音包，请在系统设置中安装英语语音", true);
-        }, 700);
-      }
+      // 不把 getVoices() 为空当成“没有语音包”。iOS 往往要等第一次 speak 后
+      // 才会返回语音列表，但系统默认语音此时已经可以正常朗读。
+      window.setTimeout(loadVoices, 300);
     } catch (error) {
       console.warn("Speech failed", error);
       toast("语音播放失败，请检查系统语音设置", true);
@@ -818,10 +907,25 @@
     return feedbackAudio;
   }
 
-  function scheduleCorrectCue(ctx, start) {
+  function feedbackOutput(ctx) {
+    const master = ctx.createGain();
+    master.gain.value = Number(store.settings.soundVolume) || 1.5;
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.setValueAtTime(-20, ctx.currentTime);
+    compressor.knee.setValueAtTime(24, ctx.currentTime);
+    compressor.ratio.setValueAtTime(5, ctx.currentTime);
+    compressor.attack.setValueAtTime(0.003, ctx.currentTime);
+    compressor.release.setValueAtTime(0.22, ctx.currentTime);
+    master.connect(compressor);
+    compressor.connect(ctx.destination);
+    return master;
+  }
+
+  function scheduleCorrectCue(ctx, start, output) {
     [
-      { freq: 1046.5, offset: 0, duration: 0.22, volume: 0.16 },
-      { freq: 1568, offset: 0.075, duration: 0.3, volume: 0.13 },
+      { freq: 1046.5, offset: 0, duration: 0.24, volume: 0.52 },
+      { freq: 1568, offset: 0.08, duration: 0.34, volume: 0.42 },
+      { freq: 2093, offset: 0.08, duration: 0.2, volume: 0.08 },
     ].forEach(({ freq, offset, duration, volume }) => {
       const at = start + offset;
       const osc = ctx.createOscillator();
@@ -832,16 +936,39 @@
       gain.gain.exponentialRampToValueAtTime(volume, at + 0.008);
       gain.gain.exponentialRampToValueAtTime(0.0001, at + duration);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(output);
       osc.start(at);
       osc.stop(at + duration + 0.02);
     });
   }
 
-  function scheduleWrongCue(ctx, start) {
+  function scheduleNoise(ctx, start, output) {
+    const length = Math.max(1, Math.floor(ctx.sampleRate * 0.075));
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i += 1) {
+      const fade = Math.pow(1 - i / length, 3);
+      data[i] = (Math.random() * 2 - 1) * fade;
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(1200, start);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.28, start);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.08);
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(output);
+    source.start(start);
+    source.stop(start + 0.09);
+  }
+
+  function scheduleWrongCue(ctx, start, output) {
     [
-      { type: "sine", from: 190, to: 65, volume: 0.22, duration: 0.38 },
-      { type: "triangle", from: 96, to: 48, volume: 0.07, duration: 0.32 },
+      { type: "sine", from: 260, to: 82, volume: 0.62, duration: 0.4 },
+      { type: "triangle", from: 520, to: 190, volume: 0.2, duration: 0.27 },
     ].forEach(({ type, from, to, volume, duration }) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -849,13 +976,14 @@
       osc.frequency.setValueAtTime(from, start);
       osc.frequency.exponentialRampToValueAtTime(to, start + duration);
       gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(volume, start + 0.012);
+      gain.gain.exponentialRampToValueAtTime(volume, start + 0.01);
       gain.gain.exponentialRampToValueAtTime(0.0001, start + duration + 0.03);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(output);
       osc.start(start);
       osc.stop(start + duration + 0.05);
     });
+    scheduleNoise(ctx, start, output);
   }
 
   function playFeedback(isCorrect, force = false) {
@@ -864,8 +992,9 @@
     if (!ctx) return;
     const start = () => {
       try {
-        if (isCorrect) scheduleCorrectCue(ctx, ctx.currentTime + 0.015);
-        else scheduleWrongCue(ctx, ctx.currentTime + 0.015);
+        const output = feedbackOutput(ctx);
+        if (isCorrect) scheduleCorrectCue(ctx, ctx.currentTime + 0.015, output);
+        else scheduleWrongCue(ctx, ctx.currentTime + 0.015, output);
       } catch (error) {
         console.warn("Feedback sound failed", error);
       }
@@ -1026,10 +1155,41 @@
   }
 
   /* ---------------- home ---------------- */
+  function renderBookGate(scope = "home") {
+    const meta = state.meta && state.meta.books.find((item) => item.id === store.settings.bookId);
+    const name = meta ? meta.name : "当前词库";
+    const isWrong = scope === "wrong";
+    if (ui.bookError) {
+      $("#view").innerHTML = `
+        <div class="page-head">
+          <div><h2>${isWrong ? "错词本" : "词听"}</h2><p>${esc(name)} · 加载失败</p></div>
+        </div>
+        <div class="book-gate is-error">
+          <div class="book-gate-icon">!</div>
+          <h3>词库没有下载完成</h3>
+          <p>可能是网络中断，或浏览器缓存了旧文件。请保持联网后重试。</p>
+          <p class="book-gate-detail">${esc(ui.bookError)}</p>
+          <button class="primary-btn" type="button" data-retry-book>重新加载词库</button>
+          <button class="ghost-btn" type="button" data-action="install-help">查看安装说明</button>
+        </div>`;
+      return;
+    }
+    $("#view").innerHTML = `
+      <div class="page-head">
+        <div><h2>${isWrong ? "错词本" : "词听"}</h2><p>${esc(name)} · 正在准备</p></div>
+      </div>
+      <div class="book-gate">
+        <div class="book-gate-spinner" aria-hidden="true"></div>
+        <h3>正在加载 ${esc(name)}</h3>
+        <p>第一次需要下载词库文件，网络较慢时会自动重试。</p>
+        <p class="book-gate-detail">下载完成后会自动进入，不需要一直停在启动页。</p>
+      </div>`;
+  }
+
   function renderHome() {
     const book = currentBook();
     if (!book) {
-      renderFatal("词库还没有准备好。");
+      renderBookGate("home");
       return;
     }
     const today = getToday();
@@ -1162,7 +1322,10 @@
   /* ---------------- wrong words ---------------- */
   function renderWrong() {
     const book = currentBook();
-    if (!book) return;
+    if (!book) {
+      renderBookGate("wrong");
+      return;
+    }
     const list = wrongEntries(book);
     const due = dueWords(book).filter((item) => (item.item.wrongCount || 0) > 0).length;
 
@@ -1314,9 +1477,11 @@
   function renderSettings() {
     const installed = isStandalone();
     const ios = isIOS();
-    const swText = ui.swReady
-      ? "离线缓存已就绪，断网也能打开"
-      : "离线缓存准备中，请保持页面打开片刻";
+    const swText = ui.offlineReady
+      ? "全部词库已离线缓存，断网也能查词"
+      : ui.offlineProgress
+        ? `正在后台缓存词库 ${ui.offlineProgress}/${ui.offlineTotal}`
+        : "正在准备离线缓存，可以继续背单词";
     const book = currentBook();
     const totalWords = state.meta ? state.meta.books.reduce((sum, item) => sum + item.count, 0) : 0;
 
@@ -1365,6 +1530,18 @@
       </div>
 
       <div class="settings-group">
+        <div class="settings-title">输入</div>
+        <div class="setting-row">
+          <div class="setting-copy"><strong>内置软键盘</strong><small>手机上不再弹出系统键盘，避免联想和自动改词</small></div>
+          <button type="button" class="switch ${store.settings.softKeyboard ? "is-on" : ""}" role="switch" aria-checked="${store.settings.softKeyboard}" data-toggle="softKeyboard" aria-label="内置软键盘"></button>
+        </div>
+        <div class="setting-row">
+          <div class="setting-copy"><strong>手写识别</strong><small>在答题卡里写印刷体，每格一个字母，自动判分</small></div>
+          <span class="pill green">实验</span>
+        </div>
+      </div>
+
+      <div class="settings-group">
         <div class="settings-title">发音</div>
         <div class="setting-row">
           <div class="setting-copy"><strong>口音</strong><small>使用设备自带的离线英语语音</small></div>
@@ -1381,7 +1558,14 @@
           </div>
         </div>
         <div class="setting-row">
-          <div class="setting-copy"><strong>语音测试</strong><small>测试当前设备的英语语音</small></div>
+          <div class="setting-copy"><strong>音效音量</strong><small>手机媒体音量也会影响实际响度</small></div>
+          <div class="segmented" role="group" aria-label="答题音效音量">
+            ${[[0.7, "小"], [1, "中"], [1.5, "大"]].map(([value, label]) => `
+              <button type="button" data-setting="soundVolume" data-value="${value}" class="${Number(store.settings.soundVolume) === value ? "is-active" : ""}">${label}</button>`).join("")}
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-copy"><strong>语音测试</strong><small>第一次请点一下，让浏览器启用系统语音</small></div>
           <button class="mini-btn" type="button" data-speak="vocabulary">${ICONS.speaker} 读一下</button>
         </div>
       </div>
@@ -1404,8 +1588,11 @@
       <div class="settings-group">
         <div class="settings-title">离线与更新</div>
         <div class="setting-row">
-          <div class="setting-copy"><strong>离线状态</strong><small>${esc(swText)}</small></div>
-          <span class="pill ${ui.swReady ? "green" : "amber"}">${ui.swReady ? "离线可用" : "准备中"}</span>
+          <div class="setting-copy"><strong>离线词库</strong><small>${esc(swText)}</small></div>
+          <div class="data-actions">
+            ${ui.offlineReady ? "" : `<button class="mini-btn" type="button" data-action="cache-offline">立即缓存</button>`}
+            <span class="pill ${ui.offlineReady ? "green" : "amber"}">${ui.offlineReady ? "已就绪" : "缓存中"}</span>
+          </div>
         </div>
         <div class="setting-row">
           <div class="setting-copy"><strong>检查更新</strong><small>有新版本时，重新打开即可</small></div>
@@ -1424,7 +1611,7 @@
         </div>
         <p>版本 ${APP_VERSION} · 词库 ${totalWords} 词 · 查词 ${state.meta ? state.meta.dictCount : 0} 条${book ? ` · 当前 ${esc(book.name)}` : ""}</p>
         <p>词库来自 KyleBing/english-vocabulary（BSD-3-Clause）与 pluto0x0/word3500（MIT），仅供学习使用。音标、释义和例句版权归原作者。</p>
-        <p>发音调用手机系统自带的英语语音，不需要联网。如果没声音，请在系统设置中安装英语语音包。</p>
+        <p>发音调用手机系统自带的英语语音，不需要联网。第一次请先在“语音测试”点一下“读一下”；如果仍没声音，再检查媒体音量或安装英语语音。</p>
       </div>
 
       <p class="settings-footnote">词听 v${APP_VERSION}<br>数据只保存在本机 localStorage</p>
@@ -1547,6 +1734,8 @@
     settings.accent = settings.accent === "uk" ? "uk" : "us";
     settings.order = settings.order === "sequence" ? "sequence" : "random";
     settings.sound = settings.sound !== false;
+    if (typeof settings.softKeyboard !== "boolean") settings.softKeyboard = isTouchDevice();
+    settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
     settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
     return {
       version: 1,
@@ -1621,23 +1810,27 @@
     try {
       if (!state.books[id]) {
         toast("正在加载词库…");
-        await loadBook(id);
+        await ensureBook(id);
       }
       store.settings.bookId = id;
+      ui.bookError = "";
       saveStore();
       closeSheet();
-      renderHome();
+      renderCurrent();
       prewarmRelations(currentBook());
       toast(`已切换到${state.meta.books.find((book) => book.id === id).name}`);
     } catch (error) {
       console.warn(error);
-      toast("词库加载失败，请重新打开页面", true);
+      toast("词库加载失败，请检查网络后重试", true);
     }
   }
 
   function openRangeSheet() {
     const book = currentBook();
-    if (!book) return;
+    if (!book) {
+      toast("词库还在加载，请稍候");
+      return;
+    }
     const [activeStart, activeEnd] = rangeFor(book);
     const chunks = [];
     for (let start = 0; start < book.words.length; start += 500) {
@@ -1806,83 +1999,655 @@
     toast(`已移出错词本：${word}`);
   }
 
-  /* ---------------- handwriting ---------------- */
-  function openHandwriting() {
-    const session = ui.session;
-    if (!session || session.answered || session.mode !== "zh2en") return;
-    const entry = session.queue[session.index].word;
-    openSheet(`
-      ${sheetHead("手写练习", "用指尖在格子里写，写完对照答案自评")}
-      <div class="hw-hint">中文提示：<strong>${esc(shortMeaning(entry.m))}</strong></div>
-      <canvas class="hw-canvas" id="hwCanvas" aria-label="手写区域"></canvas>
-      <div class="hw-actions">
-        <button class="ghost-btn" type="button" data-hw-clear>清空</button>
-        <button class="primary-btn" type="button" data-hw-reveal>写好了，看答案</button>
-      </div>
-      <div class="hw-answer" id="hwAnswer" hidden>
-        <div class="hw-word">${esc(entry.w)}</div>
-        <p>${entry.p ? `/${esc(entry.p)}/` : ""}</p>
-        <div class="hw-self">
-          <button class="primary-btn" type="button" data-hw-correct>我写对了</button>
-          <button class="ghost-btn" type="button" data-hw-wrong>写错了</button>
-        </div>
-      </div>
-      <div class="sheet-note">也可以直接在答题框里输入：把手机输入法切换成“手写”，就能手写答题并自动判分。</div>
-    `);
-    window.setTimeout(initHandwritingCanvas, 40);
+  /* ---------------- handwriting recognition ---------------- */
+  const HW_MASK_SIZE = 24;
+  const HW_ALPHABET = "abcdefghijklmnopqrstuvwxyz".split("");
+  const HW_FONT_STACKS = [
+    '700 48px "Arial", "Helvetica Neue", Helvetica, sans-serif',
+    '400 48px "Arial", "Helvetica Neue", Helvetica, sans-serif',
+    '700 48px "Verdana", Geneva, sans-serif',
+    '400 48px "Trebuchet MS", "Segoe UI", sans-serif',
+    '700 48px Georgia, "Times New Roman", serif',
+    '400 48px "Courier New", Courier, monospace',
+    '600 48px -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif',
+    '700 48px "Gill Sans", "Avenir Next", "Trebuchet MS", sans-serif',
+    // 常见平板/手机上的印刷体、手写体字体，增加对圆体和略随手写字形的覆盖。
+    '600 48px "Chalkboard", "Trebuchet MS", sans-serif',
+    '600 48px "Noteworthy", "Comic Sans MS", "Trebuchet MS", sans-serif',
+    '600 48px "Marker Felt", "Chalkboard", "Trebuchet MS", sans-serif',
+    '600 48px "Bradley Hand", "Chalkboard", "Trebuchet MS", sans-serif',
+    '600 48px "Comic Sans MS", "Chalkboard", "Trebuchet MS", sans-serif',
+    '600 48px "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif',
+    '600 48px "Futura", "Avenir Next", "Trebuchet MS", sans-serif',
+    '600 48px "Optima", "Gill Sans", "Trebuchet MS", sans-serif',
+    '600 48px "Baskerville", Georgia, "Times New Roman", serif',
+    '600 48px "Arial Rounded MT Bold", "Trebuchet MS", sans-serif',
+  ];
+  let hwTemplateBank = null;
+  let hwState = null;
+
+  function hwDistanceField(bits) {
+    const size = HW_MASK_SIZE;
+    const total = size * size;
+    const dist = new Uint8Array(total);
+    dist.fill(255);
+    const queue = new Int32Array(total);
+    let head = 0;
+    let tail = 0;
+    for (let i = 0; i < total; i += 1) {
+      if (bits[i]) {
+        dist[i] = 0;
+        queue[tail] = i;
+        tail += 1;
+      }
+    }
+    const moves = [
+      [-1, 0], [1, 0], [0, -1], [0, 1],
+      [-1, -1], [-1, 1], [1, -1], [1, 1],
+    ];
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const x = index % size;
+      const y = Math.floor(index / size);
+      const next = dist[index] + 1;
+      if (next >= 8) continue;
+      for (const [dx, dy] of moves) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+        const ni = ny * size + nx;
+        if (dist[ni] <= next) continue;
+        dist[ni] = next;
+        queue[tail] = ni;
+        tail += 1;
+      }
+    }
+    return dist;
   }
 
-  function initHandwritingCanvas() {
-    const canvas = $("#hwCanvas");
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
+  function hwInkComponents(bits) {
+    const size = HW_MASK_SIZE;
+    const seen = new Uint8Array(bits.length);
+    const queue = new Int32Array(bits.length);
+    let count = 0;
+    for (let start = 0; start < bits.length; start += 1) {
+      if (!bits[start] || seen[start]) continue;
+      count += 1;
+      let head = 0;
+      let tail = 0;
+      queue[tail] = start;
+      tail += 1;
+      seen[start] = 1;
+      while (head < tail) {
+        const index = queue[head];
+        head += 1;
+        const x = index % size;
+        const y = Math.floor(index / size);
+        if (x > 0) { const ni = index - 1; if (bits[ni] && !seen[ni]) { seen[ni] = 1; queue[tail] = ni; tail += 1; } }
+        if (x < size - 1) { const ni = index + 1; if (bits[ni] && !seen[ni]) { seen[ni] = 1; queue[tail] = ni; tail += 1; } }
+        if (y > 0) { const ni = index - size; if (bits[ni] && !seen[ni]) { seen[ni] = 1; queue[tail] = ni; tail += 1; } }
+        if (y < size - 1) { const ni = index + size; if (bits[ni] && !seen[ni]) { seen[ni] = 1; queue[tail] = ni; tail += 1; } }
+      }
+    }
+    return count;
+  }
+
+  function hwHoleCount(bits) {
+    const size = HW_MASK_SIZE;
+    const seen = new Uint8Array(bits.length);
+    const queue = new Int32Array(bits.length);
+    let head = 0;
+    let tail = 0;
+    const push = (index) => {
+      if (index < 0 || index >= bits.length || bits[index] || seen[index]) return;
+      seen[index] = 1;
+      queue[tail] = index;
+      tail += 1;
+    };
+    for (let x = 0; x < size; x += 1) { push(x); push((size - 1) * size + x); }
+    for (let y = 0; y < size; y += 1) { push(y * size); push(y * size + size - 1); }
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const x = index % size;
+      const y = Math.floor(index / size);
+      if (x > 0) push(index - 1);
+      if (x < size - 1) push(index + 1);
+      if (y > 0) push(index - size);
+      if (y < size - 1) push(index + size);
+    }
+    let holes = 0;
+    for (let start = 0; start < bits.length; start += 1) {
+      if (bits[start] || seen[start]) continue;
+      holes += 1;
+      let h = 0;
+      let t = 0;
+      queue[t] = start;
+      t += 1;
+      seen[start] = 1;
+      while (h < t) {
+        const index = queue[h];
+        h += 1;
+        const x = index % size;
+        const y = Math.floor(index / size);
+        if (x > 0 && !bits[index - 1] && !seen[index - 1]) { seen[index - 1] = 1; queue[t] = index - 1; t += 1; }
+        if (x < size - 1 && !bits[index + 1] && !seen[index + 1]) { seen[index + 1] = 1; queue[t] = index + 1; t += 1; }
+        if (y > 0 && !bits[index - size] && !seen[index - size]) { seen[index - size] = 1; queue[t] = index - size; t += 1; }
+        if (y < size - 1 && !bits[index + size] && !seen[index + size]) { seen[index + size] = 1; queue[t] = index + size; t += 1; }
+      }
+    }
+    return holes;
+  }
+
+  function hwProfileFeatures(bits) {
+    const size = HW_MASK_SIZE;
+    const col = new Float32Array(size);
+    const row = new Float32Array(size);
+    let ink = 0;
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        if (bits[y * size + x]) {
+          col[x] += 1;
+          row[y] += 1;
+          ink += 1;
+        }
+      }
+    }
+    if (ink) {
+      for (let i = 0; i < size; i += 1) { col[i] /= ink; row[i] /= ink; }
+    }
+    let max = 0;
+    for (let i = 0; i < size; i += 1) max = Math.max(max, col[i]);
+    let bands = 0;
+    let inBand = false;
+    for (let i = 0; i < size; i += 1) {
+      const on = max > 0 && col[i] / max > 0.28;
+      if (on && !inBand) bands += 1;
+      inBand = on;
+    }
+    return { col, row, bands };
+  }
+
+  function hwProfileDistance(a, b) {
+    let sum = 0;
+    for (let i = 0; i < a.length; i += 1) sum += Math.abs(a[i] - b[i]);
+    return sum;
+  }
+
+  function hwMaskFromCanvas(source, sx, sy, sw, sh) {
+    if (!source || sw < 2 || sh < 2) return null;
+    let data;
+    try {
+      data = source.getContext("2d").getImageData(sx, sy, sw, sh).data;
+    } catch (error) {
+      return null;
+    }
+    let minX = sw;
+    let minY = sh;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < sh; y += 1) {
+      for (let x = 0; x < sw; x += 1) {
+        if (data[(y * sw + x) * 4 + 3] > 35) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) return null;
+    const cropW = maxX - minX + 1;
+    const cropH = maxY - minY + 1;
+    if (cropW < 2 || cropH < 2) return null;
+    const pad = 2;
+    const scale = Math.min((HW_MASK_SIZE - pad * 2) / cropW, (HW_MASK_SIZE - pad * 2) / cropH);
+    const drawW = Math.max(1, Math.round(cropW * scale));
+    const drawH = Math.max(1, Math.round(cropH * scale));
+    const off = document.createElement("canvas");
+    off.width = HW_MASK_SIZE;
+    off.height = HW_MASK_SIZE;
+    const octx = off.getContext("2d");
+    octx.imageSmoothingEnabled = true;
+    octx.drawImage(
+      source,
+      sx + minX, sy + minY, cropW, cropH,
+      Math.round((HW_MASK_SIZE - drawW) / 2),
+      Math.round((HW_MASK_SIZE - drawH) / 2),
+      drawW, drawH
+    );
+    const pixels = octx.getImageData(0, 0, HW_MASK_SIZE, HW_MASK_SIZE).data;
+    const bits = new Uint8Array(HW_MASK_SIZE * HW_MASK_SIZE);
+    let ink = 0;
+    for (let i = 0; i < bits.length; i += 1) {
+      if (pixels[i * 4 + 3] > 40) {
+        bits[i] = 1;
+        ink += 1;
+      }
+    }
+    if (ink < 2) return null;
+    const profile = hwProfileFeatures(bits);
+    return {
+      bits,
+      ink,
+      aspect: cropW / cropH,
+      components: hwInkComponents(bits),
+      holes: hwHoleCount(bits),
+      colProfile: profile.col,
+      rowProfile: profile.row,
+      bands: profile.bands,
+      relHeight: cropH / sh,
+      relWidth: cropW / sw,
+      relTop: minY / sh,
+      relLeft: minX / sw,
+    };
+  }
+
+  function buildHandwritingTemplates() {
+    if (hwTemplateBank) return hwTemplateBank;
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const bank = [];
+    for (const font of HW_FONT_STACKS) {
+      for (const lower of HW_ALPHABET) {
+        for (const form of [lower, lower.toUpperCase()]) {
+          ctx.clearRect(0, 0, 64, 64);
+          ctx.fillStyle = "#000";
+          ctx.font = font;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(form, 32, 34);
+          const mask = hwMaskFromCanvas(canvas, 0, 0, 64, 64);
+          if (!mask) continue;
+          bank.push({
+            letter: lower,
+            bits: mask.bits,
+            ink: mask.ink,
+            aspect: mask.aspect,
+            components: mask.components,
+            holes: mask.holes,
+            colProfile: mask.colProfile,
+            rowProfile: mask.rowProfile,
+            bands: mask.bands,
+            relHeight: mask.relHeight,
+            relWidth: mask.relWidth,
+            relTop: mask.relTop,
+            relLeft: mask.relLeft,
+            dist: hwDistanceField(mask.bits),
+          });
+        }
+      }
+    }
+    hwTemplateBank = bank;
+    return bank;
+  }
+
+  function hwScoreMask(mask, maskDist, template) {
+    let outward = 0;
+    for (let i = 0; i < mask.bits.length; i += 1) {
+      if (mask.bits[i]) outward += Math.min(template.dist[i], 8);
+    }
+    outward /= Math.max(1, mask.ink);
+    let inward = 0;
+    for (let i = 0; i < template.bits.length; i += 1) {
+      if (template.bits[i]) inward += Math.min(maskDist[i], 8);
+    }
+    inward /= Math.max(1, template.ink);
+    const aspectPenalty = Math.min(1.4, Math.abs(Math.log(mask.aspect / template.aspect))) * 0.55;
+    const densityPenalty = Math.min(1.4, Math.abs(Math.log(mask.ink / template.ink))) * 0.05;
+    const profilePenalty = (hwProfileDistance(mask.colProfile, template.colProfile) * 0.6 + hwProfileDistance(mask.rowProfile, template.rowProfile) * 0.4) * 0.65;
+    const holePenalty = Math.min(3, Math.abs(mask.holes - template.holes)) * 0.32;
+    const componentPenalty = Math.min(3, Math.abs(mask.components - template.components)) * 0.16;
+    const bandPenalty = Math.min(3, Math.abs(mask.bands - template.bands)) * 0.14;
+    // 归一化到 24×24 后，h/n、i/l、a/d 的差别主要在于字高和宽高比，
+    // 所以额外比较字母在格子里的相对高度和宽度，避免这些形近字母互相吞掉。
+    const heightPenalty = Math.min(1.2, Math.abs(mask.relHeight - template.relHeight)) * 0.9;
+    const widthPenalty = Math.min(1.2, Math.abs(mask.relWidth - template.relWidth)) * 0.3;
+    return outward * 0.55 + inward * 0.45 + aspectPenalty + densityPenalty + profilePenalty + holePenalty + componentPenalty + bandPenalty + heightPenalty + widthPenalty;
+  }
+
+  function classifyHandwritingMask(mask) {
+    const bank = buildHandwritingTemplates();
+    const maskDist = hwDistanceField(mask.bits);
+    const byLetter = new Map();
+    for (const template of bank) {
+      const score = hwScoreMask(mask, maskDist, template);
+      const previous = byLetter.get(template.letter);
+      if (!previous || score < previous.score) {
+        byLetter.set(template.letter, { letter: template.letter, score });
+      }
+    }
+    const ranked = Array.from(byLetter.values()).sort((a, b) => a.score - b.score);
+    return {
+      best: ranked[0] || null,
+      second: ranked[1] || null,
+      scores: byLetter,
+    };
+  }
+
+  function handwritingGridLayout(chars) {
+    const wrap = $("#hwGridWrap");
+    const width = Math.max(260, Math.round((wrap && wrap.getBoundingClientRect().width) || 320));
+    const maxCols = Math.max(1, Math.min(8, Math.floor(width / 48)));
+    const cols = Math.min(Math.max(1, chars.length), maxCols);
+    const cellW = Math.min(82, width / cols);
+    const offsetX = Math.max(0, (width - cellW * cols) / 2);
+    const cellH = 68;
+    const rows = Math.ceil(chars.length / cols);
+    const height = rows * cellH + 8;
+    return { width, cols, rows, cellW, cellH, offsetX, height, yOffset: 4 };
+  }
+
+  function hwCellRect(index) {
+    const hw = hwState;
+    if (!hw) return null;
+    const col = index % hw.cols;
+    const row = Math.floor(index / hw.cols);
+    return {
+      x: hw.offsetX + col * hw.cellW,
+      y: hw.yOffset + row * hw.cellH,
+      w: hw.cellW,
+      h: hw.cellH,
+    };
+  }
+
+  function initHandwritingGrid() {
+    const session = ui.session;
+    if (!session) return;
+    const entry = session.queue[session.index].word;
+    const chars = Array.from(entry.w);
+    const grid = $("#hwGrid");
+    const ink = $("#hwCanvas");
+    const wrap = $("#hwGridWrap");
+    if (!grid || !ink || !wrap) return;
+
+    const layout = handwritingGridLayout(chars);
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
-    canvas.width = Math.max(1, Math.round(rect.width * dpr));
-    canvas.height = Math.max(1, Math.round(rect.height * dpr));
-    const ctx = canvas.getContext("2d");
-    ctx.scale(dpr, dpr);
-    ctx.fillStyle = "#22302a";
+    wrap.style.height = `${layout.height}px`;
+    for (const canvas of [grid, ink]) {
+      canvas.width = Math.max(1, Math.round(layout.width * dpr));
+      canvas.height = Math.max(1, Math.round(layout.height * dpr));
+    }
+
+    const gctx = grid.getContext("2d");
+    gctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    gctx.clearRect(0, 0, layout.width, layout.height);
+    chars.forEach((char, index) => {
+      const rect = {
+        x: layout.offsetX + (index % layout.cols) * layout.cellW + 3,
+        y: layout.yOffset + Math.floor(index / layout.cols) * layout.cellH + 3,
+        w: layout.cellW - 6,
+        h: layout.cellH - 6,
+      };
+      const isLetter = /[a-z]/i.test(char);
+      gctx.beginPath();
+      gctx.rect(rect.x, rect.y, rect.w, rect.h);
+      gctx.fillStyle = isLetter ? "rgba(255, 254, 250, 0.72)" : "rgba(235, 229, 216, 0.6)";
+      gctx.fill();
+      gctx.strokeStyle = "rgba(173, 160, 138, 0.62)";
+      gctx.lineWidth = 1;
+      gctx.stroke();
+      if (isLetter) {
+        // 三条很淡的参考线：上缘、x-height 和基线。真实手写时字高更稳定，
+        // 高度/宽度特征也更可靠。
+        gctx.save();
+        gctx.setLineDash([3, 4]);
+        gctx.strokeStyle = "rgba(199, 188, 167, 0.42)";
+        for (const ratio of [0.16, 0.5]) {
+          gctx.beginPath();
+          gctx.moveTo(rect.x + 6, rect.y + rect.h * ratio);
+          gctx.lineTo(rect.x + rect.w - 6, rect.y + rect.h * ratio);
+          gctx.stroke();
+        }
+        gctx.setLineDash([]);
+        gctx.strokeStyle = "rgba(173, 160, 138, 0.55)";
+        gctx.beginPath();
+        gctx.moveTo(rect.x + 6, rect.y + rect.h * 0.76);
+        gctx.lineTo(rect.x + rect.w - 6, rect.y + rect.h * 0.76);
+        gctx.stroke();
+        gctx.restore();
+      } else {
+        gctx.fillStyle = "rgba(120, 108, 88, 0.72)";
+        gctx.font = '22px Georgia, "Times New Roman", serif';
+        gctx.textAlign = "center";
+        gctx.textBaseline = "middle";
+        gctx.fillText(char === " " ? "␣" : char, rect.x + rect.w / 2, rect.y + rect.h / 2);
+      }
+    });
+
+    const ctx = ink.getContext("2d", { willReadFrequently: true });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.strokeStyle = "#22302a";
     ctx.lineWidth = 3.4;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    let drawing = false;
-    let lastX = 0;
-    let lastY = 0;
 
-    const point = (event) => {
-      const r = canvas.getBoundingClientRect();
-      return { x: event.clientX - r.left, y: event.clientY - r.top };
+    hwState = {
+      entry,
+      chars,
+      ...layout,
+      dpr,
+      grid,
+      ink,
+      ctx,
+      drawing: false,
+      lastX: 0,
+      lastY: 0,
+      recognized: "",
     };
 
-    canvas.addEventListener("pointerdown", (event) => {
+    const point = (event) => {
+      const rect = ink.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+
+    ink.addEventListener("pointerdown", (event) => {
+      if (!ui.session || ui.session.answered) return;
       event.preventDefault();
-      drawing = true;
+      hwState.drawing = true;
       const p = point(event);
-      lastX = p.x;
-      lastY = p.y;
+      hwState.lastX = p.x;
+      hwState.lastY = p.y;
       ctx.beginPath();
       ctx.moveTo(p.x, p.y);
       ctx.lineTo(p.x + 0.1, p.y + 0.1);
       ctx.stroke();
-      try { canvas.setPointerCapture(event.pointerId); } catch (error) { /* ignore */ }
+      try { ink.setPointerCapture(event.pointerId); } catch (error) { /* ignore */ }
     });
 
-    canvas.addEventListener("pointermove", (event) => {
-      if (!drawing) return;
+    ink.addEventListener("pointermove", (event) => {
+      if (!hwState || !hwState.drawing) return;
       event.preventDefault();
       const p = point(event);
       ctx.beginPath();
-      ctx.moveTo(lastX, lastY);
+      ctx.moveTo(hwState.lastX, hwState.lastY);
       ctx.lineTo(p.x, p.y);
       ctx.stroke();
-      lastX = p.x;
-      lastY = p.y;
+      hwState.lastX = p.x;
+      hwState.lastY = p.y;
     });
 
-    const stop = () => { drawing = false; };
-    canvas.addEventListener("pointerup", stop);
-    canvas.addEventListener("pointercancel", stop);
-    canvas.addEventListener("pointerleave", stop);
+    const stop = () => {
+      if (!hwState) return;
+      hwState.drawing = false;
+    };
+    ink.addEventListener("pointerup", stop);
+    ink.addEventListener("pointercancel", stop);
+    ink.addEventListener("pointerleave", stop);
+
+    const status = $("#hwStatus");
+    if (status) {
+      status.textContent = `请用印刷体填写 ${chars.filter((char) => /[a-z]/i.test(char)).length} 个字母，每格一个。`;
+    }
+    // 提前生成字体模板，第一次点“识别”时就不用等待。
+    window.setTimeout(() => {
+      try { buildHandwritingTemplates(); } catch (error) { console.warn("Handwriting templates failed", error); }
+    }, 160);
+  }
+
+  function clearHandwriting() {
+    if (!hwState) return;
+    const { ink, ctx } = hwState;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, ink.width, ink.height);
+    ctx.restore();
+    hwState.recognized = "";
+    const result = $("#hwResult");
+    if (result) result.hidden = true;
+    const status = $("#hwStatus");
+    if (status) status.textContent = `已清空，请重新用印刷体填写 ${hwState.chars.filter((char) => /[a-z]/i.test(char)).length} 个字母。`;
+  }
+
+  function hwCellMask(index) {
+    const hw = hwState;
+    if (!hw) return null;
+    const rect = hwCellRect(index);
+    if (!rect) return null;
+    const pad = 3;
+    const sx = clamp(Math.round((rect.x + pad) * hw.dpr), 0, Math.max(0, hw.ink.width - 2));
+    const sy = clamp(Math.round((rect.y + pad) * hw.dpr), 0, Math.max(0, hw.ink.height - 2));
+    const sw = clamp(Math.round((rect.w - pad * 2) * hw.dpr), 2, hw.ink.width - sx);
+    const sh = clamp(Math.round((rect.h - pad * 2) * hw.dpr), 2, hw.ink.height - sy);
+    return hwMaskFromCanvas(hw.ink, sx, sy, sw, sh);
+  }
+
+  function finishHandwriting(correct, answer) {
+    closeSheet();
+    window.setTimeout(() => handleAnswer(Boolean(correct), answer || "手写", null), 30);
+  }
+
+  function showHandwritingResult(recognized) {
+    const result = $("#hwResult");
+    const word = $("#hwRecognized");
+    if (!result || !word) return;
+    hwState.recognized = recognized;
+    word.textContent = recognized || "未识别";
+    result.hidden = false;
+    const status = $("#hwStatus");
+    if (status) status.textContent = "识别结果不太确定。确认后可以按识别结果判分，或重写一次。";
+  }
+
+  function recognizeHandwriting() {
+    const session = ui.session;
+    const hw = hwState;
+    if (!session || !hw || session.answered) return;
+    const button = $("[data-hw-recognize]");
+    const status = $("#hwStatus");
+    if (button) button.disabled = true;
+    if (status) status.textContent = "正在识别…";
+    window.setTimeout(() => {
+      try {
+        const results = [];
+        let missing = -1;
+        hw.chars.forEach((char, index) => {
+          if (!/[a-z]/i.test(char)) return;
+          const mask = hwCellMask(index);
+          if (!mask) {
+            if (missing < 0) missing = index;
+            return;
+          }
+          const classified = classifyHandwritingMask(mask);
+          const target = char.toLowerCase();
+          const targetScore = classified.scores.has(target) ? classified.scores.get(target).score : Infinity;
+          results.push({
+            index,
+            target,
+            letter: classified.best ? classified.best.letter : "",
+            best: classified.best,
+            second: classified.second,
+            targetScore,
+          });
+        });
+
+        if (missing >= 0) {
+          if (status) status.textContent = `第 ${hw.chars.slice(0, missing + 1).filter((char) => /[a-z]/i.test(char)).length} 个字母格还没有写。`;
+          if (button) button.disabled = false;
+          return;
+        }
+
+        const byIndex = new Map(results.map((item) => [item.index, item.letter]));
+        const recognized = hw.chars.map((char, index) => (/[a-z]/i.test(char) ? (byIndex.get(index) || "") : char)).join("");
+        const correct = isCorrectAnswer(recognized, hw.entry.w);
+
+        // 既然目标词已知，就不只看“识别第一名”。只要每个格子的笔迹和目标字母
+        // 的模板也足够接近，即使它被认成了形近字母，也按目标词判对。这样对真实
+        // 手写更宽容；如果某个格子明显更像另一个字母，则判错或让用户重写。
+        const targetMargin = (target, bestLetter) => {
+          // i/l 在印刷体里几乎一样，交给目标词判断。
+          if ((target === "i" && bestLetter === "l") || (target === "l" && bestLetter === "i")) return 0.45;
+          // 元音之间（尤其 a/o、e/i）很容易因为圆口写法而误判，宁可回退重写，
+          // 不把明显的拼写错误自动判对。
+          if ("aeiou".includes(target) && "aeiou".includes(bestLetter)) return 0.15;
+          return 0.3;
+        };
+        const targetPlausible = (item) => {
+          if (!item.best) return false;
+          if (item.target === item.best.letter) return true;
+          return item.targetScore <= 1.8 && item.targetScore <= item.best.score + targetMargin(item.target, item.best.letter);
+        };
+        const clearlyWrong = (item) => {
+          if (!item.best) return false;
+          return item.best.score <= 1.2 && item.targetScore >= item.best.score + 0.45;
+        };
+        const allTargetPlausible = results.every(targetPlausible);
+        const allClearlyWrong = results.every(clearlyWrong);
+
+        if (correct || allTargetPlausible) {
+          finishHandwriting(true, correct ? recognized : hw.entry.w);
+          return;
+        }
+        if (allClearlyWrong) {
+          finishHandwriting(false, recognized);
+          return;
+        }
+        showHandwritingResult(recognized);
+        if (button) button.disabled = false;
+      } catch (error) {
+        console.warn("Handwriting recognition failed", error);
+        if (status) status.textContent = "识别失败，请重写一次，或改用键盘输入。";
+        if (button) button.disabled = false;
+      }
+    }, 40);
+  }
+
+  function openHandwriting() {
+    const session = ui.session;
+    if (!session || session.answered || session.mode !== "zh2en") return;
+    const entry = session.queue[session.index].word;
+    const letterCount = entry.w.replace(/[^a-z]/gi, "").length;
+    openSheet(`
+      ${sheetHead("手写识别", "用印刷体在格子里写，每格一个字母；大写更准")}
+      <div class="hw-hint">中文提示：<strong>${esc(shortMeaning(entry.m))}</strong> · 共 ${letterCount} 个字母</div>
+      <div class="hw-grid-wrap" id="hwGridWrap">
+        <canvas class="hw-grid" id="hwGrid" aria-hidden="true"></canvas>
+        <canvas class="hw-ink" id="hwCanvas" aria-label="手写区域"></canvas>
+      </div>
+      <div class="hw-status" id="hwStatus">正在准备识别…</div>
+      <div class="hw-actions">
+        <button class="ghost-btn" type="button" data-hw-clear>清空</button>
+        <button class="primary-btn" type="button" data-hw-recognize>识别并提交</button>
+      </div>
+      <div class="hw-result" id="hwResult" hidden>
+        <p>识别结果</p>
+        <div class="hw-recognized" id="hwRecognized"></div>
+        <p>如果上面的字母就是你写的，按识别结果自动判分；如果识别错了，可以重写。</p>
+        <div class="hw-result-actions">
+          <button class="primary-btn" type="button" data-hw-use>按识别结果判分</button>
+          <button class="ghost-btn" type="button" data-hw-rewrite>重写</button>
+        </div>
+        <button class="text-btn" type="button" data-hw-reveal style="margin-top:8px;font-size:11px">识别总是不准？看答案自评</button>
+        <div class="hw-self" id="hwSelf" hidden>
+          <button class="primary-btn" type="button" data-hw-correct>我写对了</button>
+          <button class="ghost-btn" type="button" data-hw-wrong>写错了</button>
+        </div>
+      </div>
+      <div class="sheet-note">打印体识别是实验功能：每格只写一个字母，尽量分开、不要连笔。识别不准时建议重写，或切换到内置键盘输入。</div>
+    `);
+    window.setTimeout(initHandwritingGrid, 40);
   }
 
   /* ---------------- session ---------------- */
@@ -1928,12 +2693,18 @@
     return picked.map((entry) => ({ word: entry, isNew: !progress[entry.w] }));
   }
 
-  function startSession(mode, options = {}) {
-    const book = currentBook();
+  async function startSession(mode, options = {}) {
+    let book = currentBook();
     if (!book) {
-      toast("词库还没有准备好", true);
-      return;
+      toast("词库正在加载，请稍候…");
+      try {
+        book = await ensureCurrentBook();
+      } catch (error) {
+        toast("词库还没有加载成功，请先重试下载", true);
+        return;
+      }
     }
+    if (!book) return;
     if (mode !== "zh2en" && mode !== "en2zh") mode = "zh2en";
 
     let queue = [];
@@ -1999,6 +2770,49 @@
     )).join("");
   }
 
+  function useSoftKeyboard() {
+    return Boolean(store.settings.softKeyboard);
+  }
+
+  function softKeyboardHTML() {
+    const rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
+    return `
+      <div class="soft-keyboard" id="softKeyboard" aria-label="内置英文键盘">
+        ${rows.map((row) => `
+          <div class="sk-row">
+            ${Array.from(row).map((letter) => `<button class="sk-key" type="button" data-key="${letter}">${letter}</button>`).join("")}
+          </div>`).join("")}
+        <div class="sk-row">
+          <button class="sk-key special" type="button" data-key="'">'</button>
+          <button class="sk-key special" type="button" data-key="-">-</button>
+          <button class="sk-key special wide" type="button" data-key="space">空格</button>
+          <button class="sk-key special wide" type="button" data-key="backspace" aria-label="删除一个字母">⌫</button>
+          <button class="sk-key special wide submit" type="button" data-key="submit">提交</button>
+        </div>
+      </div>`;
+  }
+
+  function pressSoftKey(key) {
+    const session = ui.session;
+    if (!session || session.answered || session.mode !== "zh2en") return;
+    const input = $("#answerInput");
+    if (!input) return;
+    if (key === "submit") {
+      submitSpelling();
+      return;
+    }
+    if (key === "backspace") {
+      input.value = input.value.slice(0, -1);
+      return;
+    }
+    if (key === "space") {
+      if (input.value && !input.value.endsWith(" ")) input.value += " ";
+      return;
+    }
+    if (input.value.length >= 48) return;
+    input.value += key;
+  }
+
   function questionHTML(item) {
     const session = ui.session;
     const entry = item.word;
@@ -2015,15 +2829,19 @@
               <button class="ghost-chip" type="button" data-handwriting>${ICONS.pencil} 手写板</button>
             </div>
             <div class="word-slots" aria-label="共 ${entry.w.replace(/[^a-z]/gi, "").length} 个字母">${slotsHTML(entry.w)}</div>
-            <input class="answer-input" id="answerInput" type="text" inputmode="text"
+            <input class="answer-input ${useSoftKeyboard() ? "is-soft" : ""}" id="answerInput" type="text"
+              inputmode="${useSoftKeyboard() && isTouchDevice() ? "none" : "text"}"
+              ${useSoftKeyboard() && isTouchDevice() ? "readonly" : ""}
               autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
-              enterkeyhint="done" aria-label="输入英文单词" placeholder="输入或手写这个单词">
-            <div class="answer-row">
-              <button class="primary-btn" type="button" data-submit>提交</button>
+              enterkeyhint="done" aria-label="输入英文单词"
+              placeholder="${useSoftKeyboard() ? "用下方键盘输入" : "输入或手写这个单词"}">
+            <div class="answer-row ${useSoftKeyboard() ? "is-soft" : ""}">
+              ${useSoftKeyboard() ? "" : '<button class="primary-btn" type="button" data-submit>提交</button>'}
               <button class="ghost-btn" type="button" data-hint>提示</button>
               <button class="ghost-btn reveal-btn" type="button" data-reveal>不会</button>
             </div>
             <div class="hint-text" id="hintText"></div>
+            ${useSoftKeyboard() ? softKeyboardHTML() : ""}
           </div>
         </div>`;
     }
@@ -2463,21 +3281,32 @@
         store.settings.bookId = state.meta.books[0].id;
         saveStore();
       }
-      await loadBook(store.settings.bookId);
+
+      // 元数据很小。先进入应用，再异步加载大词库；这样 Safari / 手机网络
+      // 即使下载很慢也不会一直卡在启动页。
       hideSplash();
       updateChrome();
-      renderHome();
-      prewarmRelations(currentBook());
-
-      loadDict().catch((error) => console.warn("Dictionary will load on demand", error));
+      renderCurrent();
       registerServiceWorker();
 
       const params = new URLSearchParams(location.search);
       const mode = params.get("mode");
       if (mode === "zh2en" || mode === "en2zh") {
         history.replaceState(null, "", location.pathname + location.hash);
-        setTimeout(() => startSession(mode), 420);
       }
+
+      ensureCurrentBook()
+        .then((book) => {
+          loadDict().catch((error) => console.warn("Dictionary will load on demand", error));
+          if (mode === "zh2en" || mode === "en2zh") {
+            window.setTimeout(() => startSession(mode), 180);
+          }
+          return book;
+        })
+        .catch((error) => {
+          console.warn("Book load failed", error);
+          toast("词库下载失败，请联网后点“重新加载词库”", true);
+        });
     } catch (error) {
       console.error(error);
       let message = "词库加载失败，请检查页面文件是否完整。";
@@ -2490,18 +3319,78 @@
     }
   }
 
+  function handleServiceWorkerMessage(event) {
+    const data = event.data || {};
+    if (data.type === "OFFLINE_PROGRESS") {
+      ui.swReady = true;
+      ui.offlineProgress = Number(data.done) || 0;
+      ui.offlineTotal = Number(data.total) || 6;
+      if (ui.tab === "settings") renderSettings();
+      return;
+    }
+    if (data.type === "OFFLINE_READY") {
+      ui.swReady = true;
+      ui.offlineReady = true;
+      ui.offlineProgress = Number(data.total) || 6;
+      ui.offlineTotal = Number(data.total) || 6;
+      if (ui.tab === "settings") renderSettings();
+      if (!sessionStorage.getItem("citing.offlineNotified")) {
+        sessionStorage.setItem("citing.offlineNotified", "1");
+        window.setTimeout(() => toast("全部词库已离线缓存，断网也能查词"), 900);
+      }
+      return;
+    }
+    if (data.type === "OFFLINE_STATUS") {
+      ui.swReady = true;
+      ui.offlineReady = Boolean(data.ready);
+      ui.offlineProgress = Number(data.done) || 0;
+      ui.offlineTotal = Number(data.total) || 6;
+      if (ui.tab === "settings") renderSettings();
+      if (!ui.offlineReady) {
+        const worker = navigator.serviceWorker.controller;
+        if (worker) worker.postMessage({ type: "CACHE_DATA" });
+      }
+      return;
+    }
+    if (data.type === "OFFLINE_ERROR") {
+      console.warn("Offline cache failed", data.message || "");
+      if (ui.tab === "settings") renderSettings();
+    }
+  }
+
+  async function requestOfflineCache(manual = false) {
+    if (location.protocol === "file:" || !("serviceWorker" in navigator)) {
+      if (manual) toast("当前打开方式不支持离线缓存", true);
+      return;
+    }
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      ui.swReady = true;
+      const worker = registration.active;
+      if (!worker) {
+        if (manual) toast("离线缓存还没有准备好，请稍后再试", true);
+        return;
+      }
+      if (manual) toast("正在后台缓存离线词库，可以继续使用");
+      worker.postMessage({ type: "CACHE_STATUS" });
+      worker.postMessage({ type: "CACHE_DATA" });
+      if (ui.tab === "settings") renderSettings();
+    } catch (error) {
+      console.warn("Offline cache request failed", error);
+      if (manual) toast("离线缓存请求失败，请检查网络", true);
+    }
+  }
+
   async function registerServiceWorker() {
     if (location.protocol === "file:" || !("serviceWorker" in navigator)) return;
     try {
       const registration = await navigator.serviceWorker.register("sw.js", { scope: "./" });
+      navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
       navigator.serviceWorker.ready.then(() => {
         ui.swReady = true;
         if (ui.tab === "settings") renderSettings();
-        if (!sessionStorage.getItem("citing.swNotified")) {
-          sessionStorage.setItem("citing.swNotified", "1");
-          setTimeout(() => toast("离线词库已就绪，断网也能使用"), 1400);
-        }
-      });
+        requestOfflineCache();
+      }).catch((error) => console.warn("Service worker ready failed", error));
       registration.addEventListener("updatefound", () => {
         const worker = registration.installing;
         if (!worker) return;
@@ -2512,12 +3401,7 @@
         });
       });
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible" && !ui.swReady) {
-          navigator.serviceWorker.ready.then(() => {
-            ui.swReady = true;
-            if (ui.tab === "settings") renderSettings();
-          }).catch(() => {});
-        }
+        if (document.visibilityState === "visible" && !ui.offlineReady) requestOfflineCache();
       });
     } catch (error) {
       console.warn("Service worker registration failed", error);
@@ -2541,6 +3425,11 @@
 
     $("#view").addEventListener("click", (event) => {
       const target = event.target;
+      if (target.closest("[data-retry-book]")) {
+        ui.bookError = "";
+        ensureCurrentBook().catch(() => {});
+        return;
+      }
       const bookButton = target.closest("[data-book]");
       if (bookButton) {
         selectBook(bookButton.dataset.book);
@@ -2587,6 +3476,10 @@
         else if (key === "dailyReview") store.settings.dailyReview = clamp(parseInt(value, 10) || 20, 0, 100);
         else if (key === "accent") store.settings.accent = value === "uk" ? "uk" : "us";
         else if (key === "order") store.settings.order = value === "sequence" ? "sequence" : "random";
+        else if (key === "soundVolume") {
+          const volume = Number(value);
+          store.settings.soundVolume = [0.7, 1, 1.5].includes(volume) ? volume : 1.5;
+        }
         saveStore();
         renderSettings();
         if (key === "order" && store.settings.order === "random") prewarmRelations(currentBook());
@@ -2597,6 +3490,13 @@
         const key = toggle.dataset.toggle;
         if (key === "autoSpeak") store.settings.autoSpeak = !store.settings.autoSpeak;
         else if (key === "sound") store.settings.sound = !store.settings.sound;
+        else if (key === "softKeyboard") {
+          store.settings.softKeyboard = !store.settings.softKeyboard;
+          if (ui.session && ui.session.mode === "zh2en" && !ui.session.answered) {
+            const input = $("#answerInput");
+            if (input) input.value = "";
+          }
+        }
         saveStore();
         renderSettings();
         return;
@@ -2613,6 +3513,7 @@
         else if (action === "import") importData();
         else if (action === "reset") resetData();
         else if (action === "sound-preview") previewFeedbackSound();
+        else if (action === "cache-offline") requestOfflineCache(true);
         else if (action === "update") checkUpdate();
         return;
       }
@@ -2626,6 +3527,12 @@
       }
       if (target.closest("[data-next]")) {
         nextQuestion();
+        return;
+      }
+      const softKey = target.closest("[data-key]");
+      if (softKey) {
+        event.preventDefault();
+        pressSoftKey(softKey.dataset.key);
         return;
       }
       const option = target.closest("[data-option]");
@@ -2665,11 +3572,15 @@
       if (!session) return;
       if (session.answered) {
         event.preventDefault();
+        event.stopPropagation();
         nextQuestion();
         return;
       }
       if (event.target && event.target.id === "answerInput") {
         event.preventDefault();
+        // 这一下只负责“提交并显示答案”。如果不拦住冒泡，document 上的
+        // Enter 处理会紧接着看到 answered=true，又跳到下一题。
+        event.stopPropagation();
         submitSpelling();
       }
     });
@@ -2696,20 +3607,31 @@
         return;
       }
       if (target.closest("[data-hw-clear]")) {
-        const canvas = $("#hwCanvas");
-        if (!canvas) return;
-        const ctx = canvas.getContext("2d");
-        ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.restore();
+        clearHandwriting();
+        return;
+      }
+      if (target.closest("[data-hw-recognize]")) {
+        recognizeHandwriting();
+        return;
+      }
+      if (target.closest("[data-hw-use]")) {
+        if (!hwState) return;
+        finishHandwriting(isCorrectAnswer(hwState.recognized, hwState.entry.w), hwState.recognized);
+        return;
+      }
+      if (target.closest("[data-hw-rewrite]")) {
+        clearHandwriting();
         return;
       }
       if (target.closest("[data-hw-reveal]")) {
-        const answer = $("#hwAnswer");
+        const self = $("#hwSelf");
         const reveal = target.closest("[data-hw-reveal]");
-        if (answer) answer.hidden = false;
+        if (self) self.hidden = false;
         if (reveal) reveal.hidden = true;
+        if (hwState) {
+          const status = $("#hwStatus");
+          if (status) status.textContent = `答案：${hwState.entry.w}。请对照后选择。`;
+        }
         return;
       }
       if (target.closest("[data-hw-correct]")) {
@@ -2727,7 +3649,7 @@
       const speechButton = event.target.closest("[data-speak]");
       if (speechButton) {
         event.preventDefault();
-        speak(speechButton.dataset.speak);
+        speak(speechButton.dataset.speak, { gesture: true });
         return;
       }
       const wordButton = event.target.closest(".tapword, [data-word]");
@@ -2746,6 +3668,7 @@
     });
 
     document.addEventListener("keydown", (event) => {
+      if (event.defaultPrevented) return;
       if (event.key === "Escape") {
         if (ui.sheetOpen) {
           closeSheet();

@@ -6,7 +6,7 @@
   --card-soft: #faf6ec;
   --ink: #202a24;
   --ink-soft: #34433a;
-  --muted: #647064;
+  --muted: #5f6b5f;
   --faint: #756c5c;
   --line: #e5ddcb;
   --line-strong: #d6cbb5;
@@ -14,7 +14,7 @@
   --accent-deep: #1e3a2c;
   --accent-soft: #e5efe7;
   --amber: #e0a044;
-  --amber-deep: #b97920;
+  --amber-deep: #8a5a12;
   --amber-soft: #f9ecd6;
   --red: #bd4d3f;
   --red-soft: #f9e6e1;
@@ -135,6 +135,71 @@ svg {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
+}
+
+.book-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-top: 22px;
+  padding: 32px 22px;
+  border-radius: 20px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  text-align: center;
+}
+
+.book-gate h3 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.book-gate p {
+  max-width: 300px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.book-gate .book-gate-detail {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.book-gate .primary-btn,
+.book-gate .ghost-btn {
+  width: auto;
+  min-height: 42px;
+  padding-left: 20px;
+  padding-right: 20px;
+  margin-top: 4px;
+}
+
+.book-gate-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--red-soft);
+  color: #9c3d34;
+  font-size: 23px;
+  font-weight: 700;
+}
+
+.book-gate-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid rgba(47, 107, 80, 0.16);
+  border-top-color: var(--accent);
+  animation: book-gate-spin 0.9s linear infinite;
+}
+
+@keyframes book-gate-spin {
+  to { transform: rotate(360deg); }
 }
 
 .topbar {
@@ -1928,6 +1993,110 @@ svg {
   box-shadow: 0 0 0 4px rgba(47, 107, 80, 0.1);
 }
 
+.answer-input.is-soft {
+  background: #fbf8ef;
+  caret-color: transparent;
+}
+
+.soft-keyboard {
+  margin-top: 10px;
+  padding: 8px;
+  border-radius: 16px;
+  background: var(--card-soft);
+  border: 1px solid var(--line);
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+
+/* 手机上让键盘变成一块接近全宽的浮空面板，可以稍微溢出答题卡底部。 */
+@media (max-width: 759px) {
+  .soft-keyboard {
+    position: relative;
+    z-index: 2;
+    width: calc(100vw - 12px);
+    margin-left: calc(50% - 50vw + 6px);
+    margin-bottom: -38px;
+    padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+    border-radius: 20px 20px 14px 14px;
+    border-color: rgba(214, 203, 181, 0.9);
+    background: rgba(255, 253, 247, 0.96);
+    box-shadow:
+      0 18px 38px rgba(32, 42, 36, 0.22),
+      0 1px 0 rgba(255, 255, 255, 0.8) inset;
+    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(16px);
+  }
+
+  .soft-keyboard::before {
+    content: "";
+    display: block;
+    width: 36px;
+    height: 4px;
+    margin: 0 auto 7px;
+    border-radius: 99px;
+    background: rgba(100, 112, 100, 0.24);
+  }
+}
+
+.sk-row {
+  display: flex;
+  gap: 5px;
+}
+
+.sk-row + .sk-row {
+  margin-top: 5px;
+}
+
+.sk-key {
+  flex: 1;
+  min-width: 0;
+  min-height: 43px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: #fffefa;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1;
+  box-shadow: 0 2px 0 rgba(126, 113, 90, 0.18);
+  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.08s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.sk-key:active {
+  transform: translateY(2px);
+  box-shadow: none;
+  background: var(--accent-soft);
+}
+
+.sk-key.special {
+  background: var(--card);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.sk-key.wide {
+  flex: 1.7;
+}
+
+.sk-key.submit {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fbf8ef;
+  font-size: 13px;
+}
+
+@media (max-width: 380px) {
+  .soft-keyboard { padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px)); }
+  .sk-row { gap: 4px; }
+  .sk-row + .sk-row { margin-top: 4px; }
+  .sk-key { min-height: 40px; font-size: 15px; }
+  .sk-key.special { font-size: 11px; }
+}
+
 .answer-row {
   display: flex;
   gap: 8px;
@@ -1947,6 +2116,10 @@ svg {
 .answer-row .reveal-btn {
   color: var(--muted);
   border-style: dashed;
+}
+
+.answer-row.is-soft .ghost-btn {
+  flex: 1;
 }
 
 .hint-text {
@@ -2602,18 +2775,81 @@ kbd {
   color: var(--ink);
 }
 
-.hw-canvas {
+.hw-grid-wrap {
+  position: relative;
+  width: 100%;
+  margin-top: 4px;
+  border-radius: 16px;
+  border: 1.5px solid var(--line-strong);
+  background: #fffefa;
+  overflow: hidden;
+  touch-action: none;
+}
+
+.hw-grid,
+.hw-ink {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
-  height: 250px;
-  border-radius: 16px;
-  border: 1.5px dashed var(--line-strong);
-  background-color: #fffefa;
-  background-image:
-    linear-gradient(rgba(229, 221, 203, 0.5) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(229, 221, 203, 0.5) 1px, transparent 1px);
-  background-size: 25% 25%;
+  height: 100%;
+}
+
+.hw-grid {
+  pointer-events: none;
+}
+
+.hw-ink {
   touch-action: none;
+  cursor: crosshair;
+}
+
+.hw-status {
+  min-height: 18px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.hw-result {
+  margin-top: 12px;
+  padding: 13px;
+  border-radius: 15px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  text-align: center;
+}
+
+.hw-result p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.hw-recognized {
+  margin: 4px 0 8px;
+  color: var(--ink);
+  font-family: var(--font-serif);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  word-break: break-all;
+}
+
+.hw-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  justify-content: center;
+  margin-top: 10px;
+}
+
+.hw-result-actions button {
+  flex: 1;
+  min-width: 110px;
 }
 
 .hw-actions {
@@ -2624,27 +2860,6 @@ kbd {
 
 .hw-actions button {
   flex: 1;
-}
-
-.hw-answer {
-  margin-top: 13px;
-  padding: 14px;
-  border-radius: 15px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  text-align: center;
-}
-
-.hw-answer .hw-word {
-  font-family: var(--font-serif);
-  font-size: 28px;
-  font-weight: 600;
-}
-
-.hw-answer p {
-  color: var(--muted);
-  font-size: 11px;
-  margin-top: 3px;
 }
 
 .hw-self {
