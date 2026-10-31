@@ -261,6 +261,13 @@ svg {
   text-overflow: ellipsis;
 }
 
+.top-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .icon-btn {
   flex: none;
   width: 42px;
@@ -675,6 +682,7 @@ svg {
 }
 
 .mini-progress {
+  display: block;
   height: 4px;
   border-radius: 99px;
   overflow: hidden;
@@ -693,6 +701,7 @@ svg {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
   margin: 8px 2px 0;
 }
@@ -1217,6 +1226,10 @@ svg {
   color: var(--red);
 }
 
+.mini-btn:disabled {
+  opacity: 0.45;
+}
+
 .mini-btn svg {
   width: 13px;
   height: 13px;
@@ -1566,6 +1579,27 @@ svg {
   border-color: var(--accent-deep);
 }
 
+.voice-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  max-width: 250px;
+}
+
+.voice-select {
+  max-width: 190px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--card-soft);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .switch {
   position: relative;
   flex: none;
@@ -1819,6 +1853,15 @@ svg {
   letter-spacing: 0.16em;
 }
 
+.question-kicker .kicker-tags {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
 .question-kicker .new-tag {
   letter-spacing: 0.02em;
   color: var(--amber-deep);
@@ -1827,6 +1870,22 @@ svg {
   border-radius: 6px;
   font-size: 9px;
 }
+
+.lib-tag {
+  letter-spacing: 0.02em;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+  color: #fff;
+  background: #2f6b50;
+}
+
+.lib-cet4 { background: #3f5f8a; }
+.lib-ielts { background: #b45a35; }
+.lib-kaoyan { background: #70508e; }
+.lib-upload { background: #8a6a3b; }
 
 .prompt-meaning {
   margin: 15px 0 7px;
@@ -2341,6 +2400,16 @@ svg {
   line-height: 1.6;
 }
 
+/* 完形填空原句里的空格：标出来，说明这个词填在这里 */
+.cloze-gap {
+  padding: 0 2px;
+  border-radius: 5px;
+  background: rgba(47, 107, 80, 0.1);
+  color: var(--accent);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
 .answer-actions {
   display: flex;
   gap: 8px;
@@ -2355,6 +2424,45 @@ svg {
   flex: none;
   min-width: 52px;
   padding: 10px;
+}
+
+/* 答题反馈里收词的按钮：贴在「已记入错词」下面 */
+.feedback-personal {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.personal-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 0;
+  padding: 6px 11px;
+  border-radius: 99px;
+  border: 1.2px solid var(--line-strong);
+  background: rgba(255, 253, 247, 0.72);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.personal-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.personal-btn:active {
+  background: var(--card-soft);
+}
+
+.personal-btn.is-added {
+  border-color: rgba(164, 57, 47, 0.28);
+  background: rgba(164, 57, 47, 0.07);
+  color: var(--red);
 }
 
 kbd {
@@ -2549,6 +2657,34 @@ kbd {
   transform: translate(-50%, 0);
 }
 
+/* 选择上传词汇时尽量占满屏幕，让列表可视区域更大。 */
+.sheet.is-max {
+  max-width: 900px;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100vh;
+  max-height: 100dvh;
+  border-radius: 0;
+}
+
+.sheet.is-max .sheet-content {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-top: 4px;
+  padding-bottom: calc(12px + var(--safe-bottom));
+}
+
+.sheet.is-max .sheet-content > * {
+  flex: none;
+}
+
+.sheet.is-max .upload-pick-scroll {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
+}
+
 .sheet-grip {
   flex: none;
   width: 38px;
@@ -2560,6 +2696,7 @@ kbd {
 
 .sheet-content {
   overflow-y: auto;
+  min-height: 0;
   padding: 10px 20px calc(24px + var(--safe-bottom));
   -webkit-overflow-scrolling: touch;
 }
@@ -3012,6 +3149,25 @@ kbd {
   }
 }
 
+@media (max-height: 520px) {
+  .sheet.is-max .sheet-note {
+    display: none;
+  }
+
+  .sheet.is-max .sheet-head {
+    margin-bottom: 7px;
+  }
+
+  .sheet.is-max .upload-pick-bar {
+    margin-bottom: 6px;
+    padding: 6px 10px;
+  }
+
+  .sheet.is-max .upload-pick-actions {
+    margin: 6px 0 8px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -3128,6 +3284,374 @@ body.sheet-open {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.65;
+}
+
+/* 数据导入导出：勾选要处理的范围 */
+.scope-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 6px 0 12px;
+}
+
+.scope-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: 13px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.scope-row input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.scope-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.scope-text strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.scope-text small {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.scope-meta {
+  flex: none;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.scope-row.is-all {
+  background: var(--accent-soft);
+  border-color: rgba(47, 107, 80, 0.24);
+}
+
+.scope-row.is-all .scope-text strong {
+  color: var(--accent);
+}
+
+.upload-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 30px 16px 26px;
+  border-radius: 18px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  text-align: center;
+}
+
+.upload-progress p {
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.upload-bar {
+  width: min(280px, 100%);
+  height: 6px;
+  border-radius: 99px;
+  overflow: hidden;
+  background: rgba(32, 42, 36, 0.08);
+}
+
+.upload-bar i {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.upload-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(62px, 1fr));
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.upload-summary div {
+  padding: 12px 8px;
+  border-radius: 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  text-align: center;
+}
+
+.upload-summary strong {
+  display: block;
+  font-size: 21px;
+  line-height: 1.1;
+  color: var(--ink);
+}
+
+.upload-summary span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.upload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.upload-actions .primary-btn,
+.upload-actions .ghost-btn {
+  width: auto;
+  flex: 1 1 150px;
+  min-height: 44px;
+  padding: 10px 14px;
+}
+
+.upload-actions .mini-btn {
+  flex: none;
+}
+
+.upload-section {
+  margin-top: 16px;
+}
+
+.upload-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+}
+
+.upload-section-head h3 {
+  font-size: 14px;
+}
+
+.upload-section-head span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.upload-word-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.upload-word {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 11px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  text-align: left;
+}
+
+.upload-word-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.upload-word-main strong {
+  display: block;
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.upload-word-main small {
+  display: block;
+  margin-top: 1px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.upload-word-tags {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.upload-pick-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 4px 0 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+}
+
+.upload-pick-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.upload-pick-count strong {
+  color: var(--ink);
+  font-size: 17px;
+}
+
+.upload-pick-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.upload-pick-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.upload-pick-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.upload-pick-item input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.upload-pick-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.upload-pick-word {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.upload-pick-word strong {
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.upload-pick-copy small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.upload-pick-copy em {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--faint);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.5;
+}
+
+.pick-existing {
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--card-soft);
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* 删除模式：勾中的词划掉，一眼看出会被删的一组 */
+.upload-pick-scroll.is-delete-mode input:checked + .upload-pick-copy strong {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.upload-pick-scroll {
+  max-height: min(36vh, 380px);
+  overflow-y: auto;
+  padding: 2px 4px 2px 0;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+.upload-pick-actions {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.upload-pick-actions .primary-btn,
+.upload-pick-actions .ghost-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  flex: 1 1 0;
+  min-height: 44px;
+  padding: 10px 14px;
+}
+
+.upload-pick-actions .primary-btn svg,
+.upload-pick-actions .ghost-btn svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
+
+.upload-pick-actions .primary-btn:disabled {
+  opacity: 0.55;
 }
 
 .data-actions {

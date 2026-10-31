@@ -77,7 +77,16 @@ SOFTWARE.
 
 ---
 
-## 3. 其他说明
+## 3. Mozilla PDF.js
+
+- 仓库：<https://github.com/mozilla/pdf.js>
+- 使用内容：`vendor/pdf/` 下的 PDF 文字提取组件（`pdf.min.mjs`、`pdf.worker.min.mjs`，版本 4.10.38），用于在浏览器本地读取上传的 PDF。
+- 许可证：Apache License 2.0
+- 说明：组件文件保留了原始版权与许可证头；完整许可证见 [vendor/pdf/LICENSE](vendor/pdf/LICENSE) 或 <https://www.apache.org/licenses/LICENSE-2.0>。
+
+---
+
+## 4. 其他说明
 
 - 应用图标由本项目生成，随应用代码按 MIT 许可证发布。
 - 发音使用设备系统自带的语音合成（`speechSynthesis`），项目不包含任何录音文件，也不调用在线语音服务。

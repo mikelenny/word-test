@@ -2,10 +2,34 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.3.3";
+  const APP_VERSION = "1.5.6";
   const STORAGE_KEY = "citing.state.v1";
+  const UPLOAD_KEY = "citing.upload.v1";
+  const UPLOAD_BOOK_ID = "upload";
   const DAY = 24 * 60 * 60 * 1000;
   const REVIEW_DAYS = [0, 1, 2, 4, 7, 15, 30];
+
+  // 词库层级：数字越小越基础。一个词同时出现在多个词库时，只显示最基础的归属。
+  const LIBRARY_LEVELS = [
+    { id: "gaokao", short: "高考", name: "高考 3500", color: "#2f6b50", bit: 1 },
+    { id: "cet4", short: "四级", name: "四级词汇", color: "#3f5f8a", bit: 2 },
+    { id: "ielts", short: "雅思", name: "雅思核心", color: "#b45a35", bit: 4 },
+    { id: "kaoyan", short: "考研", name: "考研词汇", color: "#70508e", bit: 8 },
+  ];
+  const LIBRARY_BY_ID = Object.fromEntries(LIBRARY_LEVELS.map((item) => [item.id, item]));
+  const UPLOAD_MAX_WORDS = 3000;
+
+  // 试卷里大量出现冠词、介词和代词；这些不是要背的“词汇”。
+  const UPLOAD_STOPWORDS = new Set(`
+    a an the and or but if of to in on at for with from by as
+    is am are was were be been being do does did have has had
+    will would can could may might must shall should
+    i you he she it we they me him her us them my your his its our their
+    this that these those there here who whom whose which what when where why how
+    not no yes so very too also only just more most some any all each every
+    both other another such own same one two three four five six seven eight nine ten
+    than then up down out off over under about into onto upon
+  `.trim().split(/\s+/));
   const GENERIC_MEANING_TOKENS = new Set([
     "一个", "一种", "一些", "一样", "一起", "一直", "一定", "一般",
     "这个", "那个", "这些", "那些", "自己", "我们", "他们", "你们",
@@ -32,6 +56,8 @@
     refresh: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.5 8.5A8 8 0 1 0 20 14"/><path d="M19.5 4v4.5H15"/></svg>`,
     phone: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="2.2"/><path d="M10.5 18h3"/></svg>`,
     eye: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.8 12s3.3-6 9.2-6 9.2 6 9.2 6-3.3 6-9.2 6-9.2-6-9.2-6Z"/><circle cx="12" cy="12" r="2.6"/></svg>`,
+    plus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>`,
+    minus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg>`,
   };
 
   const MODE_LABEL = {
@@ -91,6 +117,10 @@
     dict: null,
     dictPromise: null,
     bookPromises: {},
+    wordIndex: null,
+    wordIndexPromise: null,
+    upload: loadUpload(),
+    pdfjsPromise: null,
   };
 
   const ui = {
@@ -109,6 +139,11 @@
     bookPromise: null,
     sentenceSeed: 0,
     lastFocus: null,
+    uploadBusy: false,
+    uploadInput: null,
+    uploadDraft: null,
+    uploadDrag: null,
+    uploadSuppressClick: 0,
   };
 
   let store = loadStore();
@@ -392,6 +427,28 @@
       .join("");
   }
 
+  // 完形填空的原句里保留空格标记，只是把它标出来，方便对上原题。
+  function renderPaperExample(text) {
+    return renderTappable(text).replace(
+      /_{2,}\s*\d{1,3}\s*_{2,}|_{2,}\s*\d{1,3}\b|\b\d{1,3}\s*_{2,}/g,
+      (mark) => `<span class="cloze-gap">${mark}</span>`
+    );
+  }
+
+  // 朗读用：把当前这个词填进第一个空格，其余空格去掉，免得读出“下划线”。
+  function fillClozeGap(text, word) {
+    const gap = /_{2,}\s*\d{1,3}\s*_{2,}|_{2,}\s*\d{1,3}\b|\b\d{1,3}\s*_{2,}|\(\s*\d{1,3}\s*\)/g;
+    let used = false;
+    return String(text || "")
+      .replace(gap, () => {
+        if (used) return "";
+        used = true;
+        return word || "";
+      })
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+
   function posMeaning(meaning) {
     const safe = esc(meaning || "");
     return safe.replace(
@@ -420,6 +477,7 @@
       settings.accent = settings.accent === "uk" ? "uk" : "us";
       settings.order = settings.order === "sequence" ? "sequence" : "random";
       settings.sound = settings.sound !== false;
+      settings.voiceURI = typeof settings.voiceURI === "string" ? settings.voiceURI : "";
       if (typeof settings.softKeyboard !== "boolean") settings.softKeyboard = isTouchDevice();
       settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
       settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
@@ -446,6 +504,7 @@
         dailyNew: 20,
         dailyReview: 20,
         accent: "us",
+        voiceURI: "",
         autoSpeak: false,
         order: "random",
         sound: true,
@@ -469,6 +528,114 @@
       console.warn("Failed to save local data", error);
       toast("记录保存失败：设备存储空间可能已满", true);
     }
+  }
+
+  /* ---------------- uploaded vocabulary ---------------- */
+  function loadUpload() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(UPLOAD_KEY) || "null");
+      if (!raw || typeof raw !== "object" || !Array.isArray(raw.words)) return null;
+      const words = raw.words
+        .filter((entry) => entry && typeof entry.w === "string" && entry.w)
+        .map((entry) => ({
+          ...entry,
+          w: entry.w.toLowerCase(),
+          m: entry.m || "暂无释义",
+          p: entry.p || "",
+          beyond: Boolean(entry.beyond),
+          freq: Number(entry.freq) || 1,
+        }));
+      if (!words.length) return null;
+      return {
+        version: 1,
+        createdAt: raw.createdAt || Date.now(),
+        updatedAt: raw.updatedAt || raw.createdAt || Date.now(),
+        files: Array.isArray(raw.files) ? raw.files.slice(0, 20) : [],
+        words,
+      };
+    } catch (error) {
+      console.warn("Failed to load uploaded vocabulary", error);
+      return null;
+    }
+  }
+
+  function saveUpload(upload) {
+    try {
+      localStorage.setItem(UPLOAD_KEY, JSON.stringify(upload));
+    } catch (error) {
+      console.warn("Failed to save uploaded vocabulary", error);
+      throw new Error("保存失败：设备存储空间可能已满，请先清理一些数据。");
+    }
+  }
+
+  function uploadStats(upload = state.upload) {
+    let gaokao = 0;
+    let beyond = 0;
+    const libraries = {};
+    for (const entry of (upload && upload.words) || []) {
+      if (entry.beyond) beyond += 1;
+      else gaokao += 1;
+      const library = affiliationFor(entry.w, entry);
+      if (library) libraries[library.id] = (libraries[library.id] || 0) + 1;
+    }
+    return { total: gaokao + beyond, gaokao, beyond, libraries };
+  }
+
+  function uploadSummaryHTML(stats) {
+    const items = [[stats.total, "累计词汇"]];
+    for (const library of LIBRARY_LEVELS) {
+      if (stats.libraries[library.id]) items.push([stats.libraries[library.id], library.short]);
+    }
+    return `
+      <div class="upload-summary">
+        ${items.map(([value, label]) => `<div><strong>${value}</strong><span>${label}</span></div>`).join("")}
+      </div>`;
+  }
+
+  function uploadMeta(upload) {
+    const stats = uploadStats(upload);
+    const fileName = upload && upload.files && upload.files[0] ? upload.files[0].name : "";
+    return {
+      id: UPLOAD_BOOK_ID,
+      name: "个人词汇",
+      short: "个人",
+      subtitle: "自己收进来的词",
+      description: fileName ? `${fileName} · ${stats.total} 词` : `${stats.total} 词`,
+      color: "#8a6a3b",
+      count: stats.total,
+      uploaded: true,
+    };
+  }
+
+  // 把“个人词汇”放在学习范围最前面，和普通词库共用同一套练习逻辑。
+  function syncUploadBookMeta() {
+    if (!state.meta || !Array.isArray(state.meta.books)) return;
+    const books = state.meta.books.filter((book) => book.id !== UPLOAD_BOOK_ID);
+    if (state.upload && state.upload.words.length) books.unshift(uploadMeta(state.upload));
+    state.meta.books = books;
+  }
+
+  function invalidateUploadBook() {
+    delete state.books[UPLOAD_BOOK_ID];
+    delete state.bookPromises[UPLOAD_BOOK_ID];
+  }
+
+  function lowestLibrary(mask) {
+    if (!mask) return null;
+    for (const library of LIBRARY_LEVELS) {
+      if (mask & library.bit) return library;
+    }
+    return null;
+  }
+
+  function affiliationFor(word, entry = null) {
+    if (entry && entry.lib && LIBRARY_BY_ID[entry.lib]) return LIBRARY_BY_ID[entry.lib];
+    const key = String(word || "").toLowerCase();
+    const mask = state.wordIndex ? state.wordIndex[key] : 0;
+    const found = lowestLibrary(mask);
+    if (found) return found;
+    const book = currentBook();
+    return book && LIBRARY_BY_ID[book.id] ? LIBRARY_BY_ID[book.id] : null;
   }
 
   function getToday() {
@@ -673,7 +840,6 @@
     }
     if (word.endsWith("er")) {
       add(word.slice(0, -2));
-      add(`${word.slice(0, -1)}`);
       if (word.length > 4 && word[word.length - 3] === word[word.length - 4]) add(word.slice(0, -3));
     }
     if (word.endsWith("est")) {
@@ -721,10 +887,63 @@
     if (!state.meta || !Array.isArray(state.meta.books) || !state.meta.books.length) {
       throw new Error("词库元数据无效");
     }
+    syncUploadBookMeta();
+  }
+
+  function loadWordIndex() {
+    if (state.wordIndex) return Promise.resolve(state.wordIndex);
+    if (!state.wordIndexPromise) {
+      state.wordIndexPromise = fetchJSON("data/word-index.json", { timeout: 15000, attempts: 3 })
+        .then((data) => {
+          state.wordIndex = data && typeof data === "object" ? data : {};
+          return state.wordIndex;
+        })
+        .catch((error) => {
+          state.wordIndexPromise = null;
+          throw error;
+        });
+    }
+    return state.wordIndexPromise;
+  }
+
+  // word-index.json 是四套词库的合并索引；如果旧缓存里没有这个文件，
+  // 就退回到逐本加载词库来建立索引。
+  async function ensureWordIndex() {
+    try {
+      return await loadWordIndex();
+    } catch (error) {
+      console.warn("Word index unavailable, building from books", error);
+      const books = await Promise.all(LIBRARY_LEVELS.map((library) => ensureBook(library.id)));
+      const index = {};
+      for (const library of LIBRARY_LEVELS) {
+        const book = books.find((item) => item.id === library.id);
+        if (!book) continue;
+        for (const entry of book.words) {
+          const key = entry.w.toLowerCase();
+          index[key] = (index[key] || 0) | library.bit;
+        }
+      }
+      state.wordIndex = index;
+      return index;
+    }
   }
 
   async function loadBook(id) {
     if (state.books[id]) return state.books[id];
+    if (id === UPLOAD_BOOK_ID) {
+      if (!state.upload || !state.upload.words.length) throw new Error("个人词汇还是空的");
+      const meta = state.meta.books.find((book) => book.id === UPLOAD_BOOK_ID);
+      const data = {
+        id: UPLOAD_BOOK_ID,
+        name: meta ? meta.name : "个人词汇",
+        color: meta ? meta.color : "#8a6a3b",
+        words: state.upload.words,
+        _index: new Map(state.upload.words.map((entry, index) => [entry.w, index])),
+        _examples: state.upload.words.filter((entry) => entry.e && !entry.cn),
+      };
+      state.books[UPLOAD_BOOK_ID] = data;
+      return data;
+    }
     const meta = state.meta.books.find((book) => book.id === id);
     if (!meta) throw new Error("没有找到这个词库");
     const data = await fetchJSON(`data/books/${id}.json`, { timeout: 30000, attempts: 3 });
@@ -735,7 +954,7 @@
     data.name = meta.name;
     data.color = meta.color;
     data._index = new Map(data.words.map((entry, index) => [entry.w, index]));
-    data._examples = data.words.filter((entry) => entry.e && entry.t);
+    data._examples = data.words.filter((entry) => entry.e);
     state.books[id] = data;
     return data;
   }
@@ -834,6 +1053,10 @@
   let voicesLoaded = false;
   let speechErrorShown = false;
 
+  // 优先使用系统里听起来更自然的英语语音；避免 Apple 的搞怪语音。
+  const PREFERRED_VOICE = /(samantha|alex|ava|allie|susan|tom|karen|daniel|serena|moira|tessa|fiona|victoria|google us english|google uk english|microsoft (aria|jenny|guy|zira|david|mark|libby|sonia|ryan|natasha))/i;
+  const NOVELTY_VOICE = /(albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|pipe organ|superstar|trinoids|whisper|wobble|zarvox|deranged|hysterical|grandma|grandpa|rocko|shelley|sandy|flo|eddy|reed|junior|ralph|kathy|princess)/i;
+
   function loadVoices() {
     if (!("speechSynthesis" in window)) return;
     try {
@@ -842,6 +1065,70 @@
     } catch (error) {
       voices = [];
     }
+  }
+
+  function voiceLang(voice) {
+    return String((voice && voice.lang) || "").toLowerCase().replace(/_/g, "-");
+  }
+
+  function voiceKey(voice) {
+    if (!voice) return "";
+    return voice.voiceURI || `${voice.name || ""}|${voice.lang || ""}`;
+  }
+
+  function voiceLabel(voice) {
+    const name = String(voice.name || "英语语音").replace(/\s*\((?:en[-_][A-Z]{2})\)\s*$/i, "");
+    const lang = String(voice.lang || "").replace("_", "-");
+    return lang ? `${name} · ${lang}` : name;
+  }
+
+  function speechVoiceScore(voice, accent) {
+    const lang = voiceLang(voice);
+    const target = String(accent || "").toLowerCase();
+    if (!/^en(?:-|$)/.test(lang)) return -1000;
+    let score = 0;
+    if (lang === target) score += 80;
+    else if (lang.slice(0, 2) === target.slice(0, 2)) score += 40;
+    else score += 10;
+    if (voice.localService) score += 25;
+    const name = String(voice.name || "");
+    if (/(enhanced|premium|natural|neural)/i.test(name)) score += 35;
+    if (PREFERRED_VOICE.test(name)) score += 30;
+    if (NOVELTY_VOICE.test(name)) score -= 200;
+    if (/compact/i.test(name)) score -= 8;
+    return score;
+  }
+
+  function englishVoices() {
+    loadVoices();
+    return voices
+      .filter((voice) => /^en(?:-|_|$)/i.test(String(voice.lang || "")))
+      .slice()
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }
+
+  function pickSpeechVoice(accent) {
+    const list = englishVoices();
+    if (!list.length) return null;
+    const saved = store.settings.voiceURI;
+    if (saved) {
+      const chosen = list.find((voice) => voiceKey(voice) === saved)
+        || list.find((voice) => voice.voiceURI === saved)
+        || list.find((voice) => `${voice.name || ""}|${voice.lang || ""}` === saved);
+      if (chosen) return chosen;
+    }
+    const chosen = list.slice().sort((a, b) => speechVoiceScore(b, accent) - speechVoiceScore(a, accent))[0];
+    return chosen;
+  }
+
+  function voiceOptionsHTML() {
+    const current = store.settings.voiceURI || "";
+    const list = englishVoices().filter((voice) => !NOVELTY_VOICE.test(String(voice.name || "")) || voiceKey(voice) === current);
+    const options = list.map((voice) => {
+      const key = voiceKey(voice);
+      return `<option value="${escAttr(key)}" ${key === current ? "selected" : ""}>${esc(voiceLabel(voice))}</option>`;
+    }).join("");
+    return `<option value="" ${current ? "" : "selected"}>系统推荐</option>${options}`;
   }
 
   if ("speechSynthesis" in window) {
@@ -864,14 +1151,15 @@
       const utterance = new SpeechSynthesisUtterance(String(text));
       const accent = store.settings.accent === "uk" ? "en-GB" : "en-US";
       utterance.lang = accent;
-      utterance.rate = options.rate || 0.88;
+      utterance.rate = options.rate || 0.9;
       utterance.pitch = 1;
       utterance.volume = 1;
-      const normalizedAccent = accent.toLowerCase();
-      const exact = voices.filter((voice) => String(voice.lang || "").toLowerCase().replace("_", "-") === normalizedAccent);
-      const english = voices.filter((voice) => /^en[-_]/i.test(String(voice.lang || "")));
-      const voice = exact.find((item) => item.localService) || exact[0] || english.find((item) => item.localService) || english[0];
-      if (voice) utterance.voice = voice;
+      const voice = pickSpeechVoice(accent);
+      if (voice) {
+        utterance.voice = voice;
+        // 用户选了不同口音的语音时，以语音自身的语言为准。
+        if (voice.lang) utterance.lang = voice.lang;
+      }
       utterance.onerror = (event) => {
         const reason = event && event.error ? event.error : "unknown";
         // 自动发音不是用户手势，Safari 会返回 not-allowed；不要因此误报“没有语音包”。
@@ -1034,6 +1322,7 @@
     const sheet = $("#sheet");
     const backdrop = $("#backdrop");
     const content = $("#sheetContent");
+    sheet.classList.toggle("is-max", options.maximized === true);
     content.innerHTML = html;
     content.scrollTop = 0;
     clearTimeout(ui.sheetTimer);
@@ -1061,6 +1350,7 @@
     const sheet = $("#sheet");
     const backdrop = $("#backdrop");
     sheet.classList.remove("is-open");
+    sheet.classList.remove("is-max");
     backdrop.classList.remove("is-open");
     ui.sheetOpen = false;
     document.body.classList.remove("sheet-open");
@@ -1070,6 +1360,7 @@
       $("#sheetContent").innerHTML = "";
     }, 290);
     ui.lookupToken += 1;
+    ui.uploadDraft = null;
     if (ui.lastFocus && typeof ui.lastFocus.focus === "function") {
       try { ui.lastFocus.focus({ preventScroll: true }); } catch (error) { /* ignore */ }
     }
@@ -1095,6 +1386,7 @@
     const title = $("#pageTitle");
     const sub = $("#pageSub");
     const action = $("#topAction");
+    const upload = $("#topUpload");
 
     topbar.hidden = false;
     view.hidden = false;
@@ -1125,6 +1417,11 @@
       title.textContent = "我的";
       sub.textContent = "离线 · 免费 · 无账号";
       action.hidden = true;
+    }
+
+    if (upload) {
+      upload.innerHTML = ICONS.upload;
+      upload.hidden = ui.tab === "settings";
     }
 
     $$(".tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.tab === ui.tab));
@@ -1204,7 +1501,7 @@
     const targetDone = newCount >= target;
     const examples = book._examples.length ? book._examples : book.words;
     const sentenceEntry = examples[(Math.floor(Date.now() / DAY) + ui.sentenceSeed) % examples.length];
-    const hasExample = Boolean(sentenceEntry && sentenceEntry.e && sentenceEntry.t);
+    const hasExample = Boolean(sentenceEntry && sentenceEntry.e && !sentenceEntry.cn);
     const showInstall = !isStandalone() && !store.settings.installHintDismissed;
 
     const bookCards = state.meta.books.map((meta) => {
@@ -1254,7 +1551,9 @@
 
       <div class="section-head">
         <h2>学习范围</h2>
-        <span class="sub">${esc(book.subtitle)}</span>
+        ${state.upload && state.upload.words.length
+          ? `<button class="mini-btn danger" type="button" data-delete-upload>${ICONS.trash} 清空个人词汇</button>`
+          : `<span class="sub">${esc(book.subtitle)}</span>`}
       </div>
       <div class="book-strip">${bookCards}</div>
       <div class="book-meta-row">
@@ -1306,7 +1605,7 @@
             <button class="small-audio" type="button" data-speak="${escAttr(sentenceEntry.e)}">${ICONS.speaker} 朗读</button>
           </div>
           <div class="sentence-en">${renderTappable(sentenceEntry.e)}</div>
-          <div class="sentence-zh">${esc(sentenceEntry.t)}</div>
+          <div class="sentence-zh">${sentenceEntry.t ? esc(sentenceEntry.t) : "— 来自试卷原文"}</div>
           <div class="sentence-tools">
             <span class="range-hint">— ${esc(sentenceEntry.w)}</span>
             <button class="text-btn" type="button" data-word="${escAttr(sentenceEntry.w)}">查看这个词</button>
@@ -1530,6 +1829,22 @@
       </div>
 
       <div class="settings-group">
+        <div class="settings-title">个人词汇</div>
+        <div class="setting-row">
+          <div class="setting-copy">
+            <strong>个人词汇</strong>
+            <small>${state.upload
+              ? `${uploadStats().total} 词 · 答题时点「加入个人词汇」或上传试卷都能加进来`
+              : "答题时点「加入个人词汇」，或上传试卷批量提取"}</small>
+          </div>
+          <div class="data-actions">
+            ${state.upload ? `<button class="mini-btn" type="button" data-action="manage-upload">查看</button>` : ""}
+            <button class="mini-btn" type="button" data-action="upload-file">${ICONS.upload} 上传试卷</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-group">
         <div class="settings-title">输入</div>
         <div class="setting-row">
           <div class="setting-copy"><strong>内置软键盘</strong><small>手机上不再弹出系统键盘，避免联想和自动改词</small></div>
@@ -1548,6 +1863,16 @@
           <div class="segmented" role="group" aria-label="发音口音">
             <button type="button" data-setting="accent" data-value="us" class="${store.settings.accent === "us" ? "is-active" : ""}">美音</button>
             <button type="button" data-setting="accent" data-value="uk" class="${store.settings.accent === "uk" ? "is-active" : ""}">英音</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-copy"><strong>朗读语音</strong><small>觉得声音怪时，换一个系统英语语音</small></div>
+          <div class="voice-picker">
+            <select class="voice-select" data-setting-select="voice" aria-label="朗读语音">
+              ${voiceOptionsHTML()}
+            </select>
+            <button class="mini-btn" type="button" data-action="voice-preview">试听</button>
+            <button class="mini-btn" type="button" data-action="refresh-voices" aria-label="刷新语音列表">刷新</button>
           </div>
         </div>
         <div class="setting-row">
@@ -1573,11 +1898,8 @@
       <div class="settings-group">
         <div class="settings-title">数据</div>
         <div class="setting-row">
-          <div class="setting-copy"><strong>备份与恢复</strong><small>换手机前导出一份 JSON 记录</small></div>
-          <div class="data-actions">
-            <button class="mini-btn" type="button" data-action="export">${ICONS.download} 导出</button>
-            <button class="mini-btn" type="button" data-action="import">${ICONS.upload} 导入</button>
-          </div>
+          <div class="setting-copy"><strong>数据导入导出</strong><small>个人词汇、错词、学习记录，可选范围</small></div>
+          <button class="mini-btn" type="button" data-action="data-transfer">${ICONS.download} 导入导出</button>
         </div>
         <div class="setting-row">
           <div class="setting-copy"><strong>清空记录</strong><small>删除进度、错词本和全部历史</small></div>
@@ -1671,26 +1993,239 @@
     openInstallHelp();
   }
 
-  function exportData() {
+  /* ---------------- 数据导入导出（可选范围） ---------------- */
+  const DATA_SCOPES = [
+    { id: "personal", label: "个人词汇", hint: "收进来的词，带音标、释义和例句" },
+    { id: "wrong", label: "错词", hint: "答错还没记牢的词和复习时间" },
+    { id: "records", label: "学习记录", hint: "全部进度、每日统计、历史与设置" },
+  ];
+
+  // 错词散在各个词库的 progress 里，集中抽出来便于单独导出。
+  function wrongWordsFrom(progress) {
+    const out = [];
+    const books = progress && typeof progress === "object" ? progress : {};
+    for (const bookId of Object.keys(books)) {
+      const map = books[bookId];
+      if (!map || typeof map !== "object") continue;
+      for (const word of Object.keys(map)) {
+        const item = map[word];
+        if (!item || typeof item !== "object") continue;
+        if (!(item.wrongCount > 0) || item.mastered) continue;
+        out.push({ b: bookId, w: word, i: item });
+      }
+    }
+    return out;
+  }
+
+  function collectWrongWords() {
+    return wrongWordsFrom(store.progress);
+  }
+
+  function dataScopeInfo() {
+    const personal = (state.upload && state.upload.words) || [];
+    const wrong = collectWrongWords();
+    const books = store.progress && typeof store.progress === "object" ? store.progress : {};
+    let seen = 0;
+    for (const bookId of Object.keys(books)) {
+      if (books[bookId] && typeof books[bookId] === "object") seen += Object.keys(books[bookId]).length;
+    }
+    const sessions = Array.isArray(store.history) ? store.history.length : 0;
+    return {
+      personal: { count: personal.length, note: `${personal.length} 词` },
+      wrong: { count: wrong.length, note: `${wrong.length} 个待复习` },
+      records: { count: seen, note: `已学 ${seen} 词 · 练习 ${sessions} 次` },
+    };
+  }
+
+  function scopedPayload(scopes) {
+    const set = new Set(scopes);
     const payload = {
       app: "词听",
       version: APP_VERSION,
       exportedAt: new Date().toISOString(),
-      data: store,
+      scopes: [...set],
     };
+    if (set.has("personal")) payload.upload = state.upload || null;
+    if (set.has("wrong")) payload.wrong = collectWrongWords();
+    if (set.has("records")) payload.data = store;
+    return payload;
+  }
+
+  function formatBytes(size) {
+    if (!Number.isFinite(size) || size <= 0) return "0 KB";
+    if (size < 1024) return `${size} B`;
+    const kb = size / 1024;
+    if (kb < 1024) return `${kb < 10 ? kb.toFixed(1) : Math.round(kb)} KB`;
+    return `${(kb / 1024).toFixed(1)} MB`;
+  }
+
+  function scopeSize(scopes) {
+    try {
+      return formatBytes(new Blob([JSON.stringify(scopedPayload(scopes))]).size);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function openDataTransferSheet() {
+    const info = dataScopeInfo();
+    const rows = DATA_SCOPES.map((scope) => `
+      <label class="scope-row">
+        <input type="checkbox" data-scope="${scope.id}" checked>
+        <span class="scope-text">
+          <strong>${scope.label}</strong>
+          <small>${scope.hint}</small>
+        </span>
+        <span class="scope-meta">${esc(info[scope.id].note)}</span>
+      </label>`).join("");
+    openSheet(`
+      ${sheetHead("数据导入导出", "先选范围，再导出或导入")}
+      <div class="scope-list">
+        ${rows}
+        <label class="scope-row is-all">
+          <input type="checkbox" data-scope="all" checked>
+          <span class="scope-text"><strong>全部</strong><small>个人词汇 + 错词 + 学习记录</small></span>
+          <span class="scope-meta">${scopeSize(["personal", "wrong", "records"])}</span>
+        </label>
+      </div>
+      <div class="upload-pick-actions">
+        <button class="primary-btn" type="button" data-data-export>${ICONS.download} 导出全部数据</button>
+        <button class="ghost-btn" type="button" data-data-import>${ICONS.upload} 选文件导入</button>
+      </div>
+      <div class="sheet-note">导出一个 JSON 文件，换设备时把它拷过去导入即可。<br>导入时「个人词汇」和「错词」按词合并，已有的不会重复；勾了「学习记录」会用文件里的进度、统计和设置覆盖本机。</div>
+    `, { focus: false });
+    updateDataTransferUI();
+  }
+
+  function scopeCheckboxes() {
+    return Array.from(document.querySelectorAll("#sheetContent [data-scope]"))
+      .filter((box) => box.dataset.scope !== "all");
+  }
+
+  function selectedScopes() {
+    return scopeCheckboxes().filter((box) => box.checked).map((box) => box.dataset.scope);
+  }
+
+  function updateDataTransferUI() {
+    const chosen = selectedScopes();
+    const allBox = document.querySelector('#sheetContent [data-scope="all"]');
+    if (allBox) allBox.checked = chosen.length === DATA_SCOPES.length;
+    const button = document.querySelector("#sheetContent [data-data-export]");
+    if (!button) return;
+    button.disabled = chosen.length === 0;
+    if (!chosen.length) button.innerHTML = "请先选择数据";
+    else if (chosen.length === DATA_SCOPES.length) button.innerHTML = `${ICONS.download} 导出全部数据`;
+    else button.innerHTML = `${ICONS.download} 导出所选 ${chosen.length} 项`;
+  }
+
+  function exportData(scopes = DATA_SCOPES.map((scope) => scope.id)) {
+    const chosen = DATA_SCOPES.map((scope) => scope.id).filter((id) => scopes.includes(id));
+    if (!chosen.length) {
+      toast("先选择要导出的数据", true);
+      return;
+    }
+    const payload = scopedPayload(chosen);
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
+    const tag = chosen.length === DATA_SCOPES.length ? "backup" : chosen.join("-");
     link.href = url;
-    link.download = `citing-backup-${todayKey()}.json`;
+    link.download = `citing-${tag}-${todayKey()}.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 3000);
-    toast("已导出备份文件");
+    const labels = DATA_SCOPES.filter((scope) => chosen.includes(scope.id)).map((scope) => scope.label);
+    toast(`已导出：${labels.join("、")}`);
   }
 
-  function importData() {
+  // 兼容旧备份：没有 scopes 字段时，按文件里实际有的内容推断。
+  function availableScopes(parsed) {
+    const out = [];
+    if (parsed && parsed.upload && Array.isArray(parsed.upload.words)) out.push("personal");
+    // 旧备份没有单独的 wrong 字段，错词藏在 data.progress 里，也能单独取出来。
+    if (parsed && (Array.isArray(parsed.wrong) || (parsed.data && parsed.data.progress))) out.push("wrong");
+    if (parsed && parsed.data && typeof parsed.data === "object") out.push("records");
+    return out;
+  }
+
+  function mergeWrongWords(list) {
+    let added = 0;
+    for (const row of list) {
+      if (!row || !row.b || !row.w) continue;
+      if (!store.progress[row.b] || typeof store.progress[row.b] !== "object") store.progress[row.b] = {};
+      const map = store.progress[row.b];
+      const incoming = row.i && typeof row.i === "object" ? row.i : {};
+      const existing = map[row.w];
+      if (!existing) {
+        map[row.w] = {
+          level: 0,
+          rightStreak: 0,
+          ...incoming,
+          wrongCount: Math.max(1, Number(incoming.wrongCount) || 1),
+          mastered: false,
+        };
+        added += 1;
+        continue;
+      }
+      existing.wrongCount = Math.max(Number(existing.wrongCount) || 0, Number(incoming.wrongCount) || 0, 1);
+      existing.mastered = false;
+      existing.rightStreak = 0;
+      if (Number.isFinite(Number(incoming.due))) {
+        const due = Number(incoming.due);
+        existing.due = Number.isFinite(Number(existing.due)) ? Math.min(Number(existing.due), due) : due;
+      }
+    }
+    if (added || list.length) saveStore();
+    return added;
+  }
+
+  function mergePersonalFrom(section) {
+    const words = Array.isArray(section && section.words) ? section.words.filter((entry) => entry && entry.w) : [];
+    if (!words.length) return 0;
+    const result = mergeUpload(words, "", { manual: true });
+    const files = Array.isArray(section.files) ? section.files : [];
+    if (files.length) {
+      const known = new Set((result.upload.files || []).map((file) => `${file.name}|${file.at}`));
+      for (const file of files) {
+        if (!file || known.has(`${file.name}|${file.at}`)) continue;
+        result.upload.files.push(file);
+      }
+      result.upload.files = result.upload.files.slice(0, 20);
+    }
+    saveUpload(result.upload);
+    state.upload = result.upload;
+    invalidateUploadBook();
+    syncUploadBookMeta();
+    return result.added;
+  }
+
+  function applyImport(parsed, scopes) {
+    const chosen = availableScopes(parsed).filter((id) => scopes.includes(id));
+    if (!chosen.length) return { ok: false, message: "文件里没有你选中的数据" };
+    const parts = [];
+    const recordsApplied = chosen.includes("records");
+    if (recordsApplied) {
+      store = loadStoreFrom(parsed.data);
+      saveStore();
+      parts.push("学习记录");
+    }
+    // 学习记录里已经带着错词，重复合并没有意义。
+    if (chosen.includes("wrong") && !recordsApplied) {
+      const list = Array.isArray(parsed.wrong)
+        ? parsed.wrong
+        : wrongWordsFrom(parsed.data && parsed.data.progress);
+      const added = mergeWrongWords(list);
+      parts.push(`错词 ${list.length} 个（新增 ${added}）`);
+    }
+    if (chosen.includes("personal")) {
+      const added = mergePersonalFrom(parsed.upload);
+      parts.push(`个人词汇 +${added} 词`);
+    }
+    return { ok: true, message: parts.join(" · ") };
+  }
+
+  function importData(scopes = DATA_SCOPES.map((scope) => scope.id)) {
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "application/json,.json";
@@ -1704,16 +2239,27 @@
       try {
         const text = await file.text();
         const parsed = JSON.parse(text);
-        const data = parsed && parsed.data ? parsed.data : parsed;
-        if (!data || typeof data !== "object" || !data.settings || !data.progress) {
+        const available = availableScopes(parsed);
+        if (!available.length) {
           toast("这个文件不是有效的词听备份", true);
           return;
         }
-        if (!confirm("导入会覆盖当前设备上的学习记录，确定继续吗？")) return;
-        store = loadStoreFrom(data);
-        saveStore();
-        toast("导入成功，正在重新打开…");
-        setTimeout(() => location.reload(), 700);
+        if (!available.some((id) => scopes.includes(id))) {
+          toast("文件里没有你选中的数据", true);
+          return;
+        }
+        const replace = available.includes("records") && scopes.includes("records");
+        const question = replace
+          ? "导入「学习记录」会用文件里的进度、统计和设置覆盖本机，确定继续吗？"
+          : "会把文件里的数据合并到本机，已有的词不会重复添加，确定继续吗？";
+        if (!confirm(question)) return;
+        const result = applyImport(parsed, scopes);
+        if (!result.ok) {
+          toast(result.message, true);
+          return;
+        }
+        toast(`导入成功：${result.message}，正在重新打开…`);
+        setTimeout(() => location.reload(), 800);
       } catch (error) {
         console.warn(error);
         toast("导入失败：文件格式不正确", true);
@@ -1734,6 +2280,7 @@
     settings.accent = settings.accent === "uk" ? "uk" : "us";
     settings.order = settings.order === "sequence" ? "sequence" : "random";
     settings.sound = settings.sound !== false;
+    settings.voiceURI = typeof settings.voiceURI === "string" ? settings.voiceURI : "";
     if (typeof settings.softKeyboard !== "boolean") settings.softKeyboard = isTouchDevice();
     settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
     settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
@@ -1862,6 +2409,1547 @@
     renderHome();
   }
 
+  /* ---------------- upload a paper ---------------- */
+  function openUploadPicker() {
+    if (ui.uploadBusy) {
+      toast("正在处理文件，请稍候");
+      return;
+    }
+    if (!ui.uploadInput) {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".txt,.doc,.docx,.pdf,text/plain,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf";
+      input.hidden = true;
+      input.addEventListener("change", () => {
+        const file = input.files && input.files[0];
+        input.value = "";
+        if (file) handleUploadFile(file);
+      });
+      document.body.appendChild(input);
+      ui.uploadInput = input;
+    }
+    ui.uploadInput.click();
+  }
+
+  function setUploadStatus(text, pct) {
+    const status = $("#uploadStatus");
+    if (status) status.textContent = text;
+    const bar = $("#uploadBar");
+    if (bar) bar.style.width = `${clamp(pct, 0, 100)}%`;
+  }
+
+  function showUploadProgress(fileName) {
+    openSheet(`
+      ${sheetHead("上传试卷", fileName)}
+      <div class="upload-progress">
+        <div class="book-gate-spinner" aria-hidden="true"></div>
+        <p id="uploadStatus">正在读取文件…</p>
+        <div class="upload-bar"><i id="uploadBar"></i></div>
+      </div>
+      <div class="sheet-note">支持 TXT、DOC、DOCX、PDF。扫描版 PDF 没有文字层，需要先 OCR 成文字版。</div>
+    `);
+  }
+
+  function decodeText(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+      return new TextDecoder("utf-16le").decode(bytes.subarray(2));
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+      return new TextDecoder("utf-16be").decode(bytes.subarray(2));
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (error) {
+      try {
+        return new TextDecoder("gb18030").decode(bytes);
+      } catch (fallbackError) {
+        return new TextDecoder("utf-8").decode(bytes);
+      }
+    }
+  }
+
+  async function inflateRaw(bytes) {
+    if (typeof DecompressionStream === "undefined") {
+      throw new Error("当前浏览器不支持解压 DOCX，请换用新版 Chrome、Edge 或 Safari。");
+    }
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  function readZipEntries(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    let eocd = -1;
+    const stop = Math.max(0, bytes.length - 65557);
+    for (let i = bytes.length - 22; i >= stop; i -= 1) {
+      if (view.getUint32(i, true) === 0x06054b50) {
+        eocd = i;
+        break;
+      }
+    }
+    if (eocd < 0) throw new Error("DOCX 文件结构损坏，无法读取。");
+    const count = view.getUint16(eocd + 10, true);
+    let offset = view.getUint32(eocd + 16, true);
+    const entries = new Map();
+    for (let i = 0; i < count; i += 1) {
+      if (offset + 46 > bytes.length || view.getUint32(offset, true) !== 0x02014b50) break;
+      const method = view.getUint16(offset + 10, true);
+      const compSize = view.getUint32(offset + 20, true);
+      const nameLen = view.getUint16(offset + 28, true);
+      const extraLen = view.getUint16(offset + 30, true);
+      const commentLen = view.getUint16(offset + 32, true);
+      const localOffset = view.getUint32(offset + 42, true);
+      const name = new TextDecoder("utf-8").decode(bytes.subarray(offset + 46, offset + 46 + nameLen));
+      entries.set(name, { method, compSize, localOffset });
+      offset += 46 + nameLen + extraLen + commentLen;
+    }
+    return { bytes, view, entries };
+  }
+
+  async function readZipEntry(zip, name) {
+    const entry = zip.entries.get(name);
+    if (!entry) return null;
+    const offset = entry.localOffset;
+    if (offset + 30 > zip.bytes.length || zip.view.getUint32(offset, true) !== 0x04034b50) return null;
+    const nameLen = zip.view.getUint16(offset + 26, true);
+    const extraLen = zip.view.getUint16(offset + 28, true);
+    const start = offset + 30 + nameLen + extraLen;
+    const data = zip.bytes.subarray(start, start + entry.compSize);
+    if (entry.method === 0) return data;
+    if (entry.method === 8) return inflateRaw(data);
+    throw new Error("DOCX 使用了不支持的压缩方式。");
+  }
+
+  function xmlToText(xml) {
+    const doc = new DOMParser().parseFromString(xml, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length) {
+      return xml.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    }
+    const paragraphs = doc.getElementsByTagName("w:p");
+    const out = [];
+    const collect = (node) => {
+      let text = "";
+      for (const child of node.childNodes) {
+        if (child.nodeType === 3) {
+          text += child.nodeValue || "";
+        } else if (child.nodeType === 1) {
+          const name = child.localName;
+          if (name === "t") text += child.textContent || "";
+          else if (name === "tab") text += " ";
+          else if (name === "br" || name === "cr") text += " ";
+          else if (name !== "instrText") text += collect(child);
+        }
+      }
+      return text;
+    };
+    for (const paragraph of paragraphs) {
+      const text = collect(paragraph).replace(/\s+/g, " ").trim();
+      if (text) out.push(text);
+    }
+    if (!out.length) {
+      for (const node of doc.getElementsByTagName("w:t")) {
+        const text = (node.textContent || "").trim();
+        if (text) out.push(text);
+      }
+    }
+    return out.join("\n");
+  }
+
+  async function extractDocxText(buffer) {
+    const zip = readZipEntries(buffer);
+    const names = Array.from(zip.entries.keys()).filter((name) => (
+      /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(name)
+    ));
+    if (!names.length) throw new Error("这个 DOCX 里没有找到正文内容。");
+    const chunks = [];
+    for (const name of names) {
+      const data = await readZipEntry(zip, name);
+      if (!data) continue;
+      chunks.push(xmlToText(new TextDecoder("utf-8").decode(data)));
+    }
+    return chunks.join("\n");
+  }
+
+  function readU16(bytes, offset) {
+    if (offset + 2 > bytes.length) return 0;
+    return bytes[offset] | (bytes[offset + 1] << 8);
+  }
+
+  function readU32(bytes, offset) {
+    if (offset + 4 > bytes.length) return 0;
+    return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+  }
+
+  function concatBytes(chunks) {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+
+  // 读取老式 .doc 的 OLE 复合文档结构，拿到 WordDocument / 0Table / 1Table 流。
+  function readCfbStreams(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length < 512 || readU32(bytes, 0) !== 0xe011cfd0 || readU32(bytes, 4) !== 0xe11ab1a1) return null;
+    const sectorSize = 1 << readU16(bytes, 30);
+    const miniSectorSize = 1 << readU16(bytes, 32);
+    const firstDirSector = readU32(bytes, 48);
+    const miniCutoff = readU32(bytes, 56);
+    const firstMiniFatSector = readU32(bytes, 60);
+    const firstDifatSector = readU32(bytes, 68);
+    const numDifatSectors = readU32(bytes, 72);
+    if (!sectorSize || !miniSectorSize) return null;
+
+    const difat = [];
+    for (let i = 0; i < 109; i += 1) {
+      const sector = readU32(bytes, 76 + i * 4);
+      if (sector !== 0xffffffff) difat.push(sector);
+    }
+    let difatSector = firstDifatSector;
+    for (let i = 0; i < numDifatSectors && difatSector !== 0xffffffff && difatSector !== 0xfffffffe; i += 1) {
+      const start = 512 + difatSector * sectorSize;
+      const count = sectorSize / 4 - 1;
+      for (let j = 0; j < count; j += 1) {
+        const sector = readU32(bytes, start + j * 4);
+        if (sector !== 0xffffffff) difat.push(sector);
+      }
+      difatSector = readU32(bytes, start + count * 4);
+    }
+
+    const fat = [];
+    for (const sector of difat) {
+      const start = 512 + sector * sectorSize;
+      for (let i = 0; i < sectorSize / 4; i += 1) fat.push(readU32(bytes, start + i * 4));
+    }
+
+    const readChain = (startSector, size) => {
+      const chunks = [];
+      const seen = new Set();
+      let sector = startSector;
+      let remaining = size;
+      while (sector !== 0xfffffffe && sector !== 0xffffffff && remaining > 0 && !seen.has(sector)) {
+        seen.add(sector);
+        const start = 512 + sector * sectorSize;
+        const length = Math.min(sectorSize, remaining);
+        chunks.push(bytes.subarray(start, start + length));
+        remaining -= length;
+        sector = fat[sector];
+      }
+      return concatBytes(chunks);
+    };
+
+    const readChainAll = (startSector) => {
+      const chunks = [];
+      const seen = new Set();
+      let sector = startSector;
+      while (sector !== 0xfffffffe && sector !== 0xffffffff && !seen.has(sector)) {
+        seen.add(sector);
+        const start = 512 + sector * sectorSize;
+        chunks.push(bytes.subarray(start, start + sectorSize));
+        sector = fat[sector];
+      }
+      return concatBytes(chunks);
+    };
+
+    const dirBytes = readChainAll(firstDirSector);
+    const entries = [];
+    for (let offset = 0; offset + 128 <= dirBytes.length; offset += 128) {
+      const type = dirBytes[offset + 66];
+      if (type !== 1 && type !== 2 && type !== 5) continue;
+      const nameLength = readU16(dirBytes, offset + 64);
+      const nameBytes = dirBytes.subarray(offset, offset + Math.max(0, Math.min(64, nameLength - 2)));
+      let name = "";
+      try {
+        name = new TextDecoder("utf-16le").decode(nameBytes);
+      } catch (error) {
+        name = "";
+      }
+      entries.push({
+        name,
+        type,
+        startSector: readU32(dirBytes, offset + 116),
+        size: readU32(dirBytes, offset + 120),
+      });
+    }
+
+    const root = entries.find((entry) => entry.type === 5);
+    const miniFat = [];
+    if (firstMiniFatSector !== 0xffffffff) {
+      const miniFatBytes = readChainAll(firstMiniFatSector);
+      for (let i = 0; i + 4 <= miniFatBytes.length; i += 4) miniFat.push(readU32(miniFatBytes, i));
+    }
+    const miniStream = root ? readChain(root.startSector, root.size) : new Uint8Array(0);
+    const readMiniChain = (startSector, size) => {
+      const chunks = [];
+      const seen = new Set();
+      let sector = startSector;
+      let remaining = size;
+      while (sector !== 0xfffffffe && sector !== 0xffffffff && remaining > 0 && !seen.has(sector)) {
+        seen.add(sector);
+        const start = sector * miniSectorSize;
+        const length = Math.min(miniSectorSize, remaining);
+        chunks.push(miniStream.subarray(start, start + length));
+        remaining -= length;
+        sector = miniFat[sector];
+      }
+      return concatBytes(chunks);
+    };
+
+    const streams = new Map();
+    for (const entry of entries) {
+      if (entry.type !== 2) continue;
+      streams.set(entry.name, entry.size < miniCutoff
+        ? readMiniChain(entry.startSector, entry.size)
+        : readChain(entry.startSector, entry.size));
+    }
+    return streams;
+  }
+
+  function scanDocStream(stream) {
+    const runs = [];
+    const scan = (step, offset) => {
+      let current = "";
+      for (let i = offset; i + step <= stream.length; i += step) {
+        const code = step === 1 ? stream[i] : stream[i] | (stream[i + 1] << 8);
+        if ((code >= 32 && code <= 126) || code === 9 || code === 10 || code === 13) {
+          current += String.fromCharCode(code);
+          if (current.length > 6000) {
+            runs.push(current);
+            current = "";
+          }
+        } else {
+          if (current.length >= 2) runs.push(current);
+          current = "";
+        }
+      }
+      if (current.length >= 2) runs.push(current);
+    };
+    scan(1, 0);
+    scan(2, 0);
+    scan(2, 1);
+    return runs.join("\n");
+  }
+
+  function extractWordBinaryText(word, table0, table1) {
+    if (!word || !word.length) return "";
+    const flags = readU16(word, 0x0a);
+    const table = (flags & 0x0200) ? table1 : table0;
+    if (table && table.length > 0x01aa) {
+      const fcClx = readU32(word, 0x01a2);
+      const lcbClx = readU32(word, 0x01a6);
+      if (lcbClx > 0 && fcClx + lcbClx <= table.length) {
+        const clx = table.subarray(fcClx, fcClx + lcbClx);
+        let pos = 0;
+        while (pos < clx.length && clx[pos] === 0x01) {
+          pos += 3 + readU16(clx, pos + 1);
+        }
+        if (pos < clx.length && clx[pos] === 0x02) {
+          const lcb = readU32(clx, pos + 1);
+          const plc = clx.subarray(pos + 5, pos + 5 + lcb);
+          const count = (lcb - 4) / 12;
+          if (Number.isInteger(count) && count > 0 && plc.length >= lcb) {
+            const cps = [];
+            for (let i = 0; i <= count; i += 1) cps.push(readU32(plc, i * 4));
+            const pcdStart = (count + 1) * 4;
+            let out = "";
+            for (let i = 0; i < count; i += 1) {
+              const pcd = pcdStart + i * 8;
+              const rawFc = readU32(plc, pcd + 2);
+              const compressed = (rawFc & 0x40000000) !== 0;
+              const fc = compressed ? (rawFc & 0x3fffffff) / 2 : (rawFc & 0x3fffffff);
+              const charCount = cps[i + 1] - cps[i];
+              if (charCount <= 0) continue;
+              if (compressed) {
+                const data = word.subarray(fc, fc + charCount);
+                let text = "";
+                for (const byte of data) text += String.fromCharCode(byte);
+                out += text;
+              } else {
+                out += new TextDecoder("utf-16le").decode(word.subarray(fc, fc + charCount * 2));
+              }
+            }
+            if (out.trim()) return out;
+          }
+        }
+      }
+    }
+    return scanDocStream(word);
+  }
+
+  function extractDocText(buffer) {
+    const streams = readCfbStreams(buffer);
+    if (streams && streams.has("WordDocument")) {
+      return extractWordBinaryText(
+        streams.get("WordDocument"),
+        streams.get("0Table"),
+        streams.get("1Table")
+      );
+    }
+    // 不是标准 OLE .doc（有些工具会直接写纯文本），退回扫描原始字节。
+    return scanDocStream(new Uint8Array(buffer));
+  }
+
+  function loadPdfJs() {
+    if (!state.pdfjsPromise) {
+      const source = new URL("vendor/pdf/pdf.min.mjs", document.baseURI).href;
+      const worker = new URL("vendor/pdf/pdf.worker.min.mjs", document.baseURI).href;
+      state.pdfjsPromise = import(source)
+        .then((module) => {
+          module.GlobalWorkerOptions.workerSrc = worker;
+          return module;
+        })
+        .catch((error) => {
+          state.pdfjsPromise = null;
+          throw new Error("PDF 组件加载失败，请联网打开一次后再试。");
+        });
+    }
+    return state.pdfjsPromise;
+  }
+
+  async function extractPdfText(buffer, report) {
+    const pdfjs = await loadPdfJs();
+    const task = pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      isEvalSupported: false,
+      useWorkerFetch: false,
+      disableFontFace: true,
+      useSystemFonts: false,
+    });
+    const doc = await task.promise;
+    const chunks = [];
+    for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
+      report(15 + Math.round((pageNumber / Math.max(1, doc.numPages)) * 38), `正在读取 PDF 第 ${pageNumber}/${doc.numPages} 页…`);
+      const page = await doc.getPage(pageNumber);
+      const content = await page.getTextContent({ normalizeWhitespace: true });
+      let text = "";
+      for (const item of content.items) {
+        if (!item || typeof item.str !== "string") continue;
+        text += item.str;
+        text += item.hasEOL ? "\n" : " ";
+      }
+      chunks.push(text);
+      page.cleanup();
+    }
+    await doc.destroy();
+    return chunks.join("\n");
+  }
+
+  async function extractTextFromFile(file, buffer, report) {
+    const name = String(file.name || "").toLowerCase();
+    const bytes = new Uint8Array(buffer);
+    const isPdf = bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+    const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+    const isOle = bytes.length >= 4 && bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0;
+
+    if (name.endsWith(".pdf") || isPdf) {
+      report(12, "正在打开 PDF…");
+      return extractPdfText(buffer, report);
+    }
+    if (name.endsWith(".docx") || isZip) {
+      report(22, "正在解压 DOCX…");
+      return extractDocxText(buffer);
+    }
+    if (name.endsWith(".doc") || isOle) {
+      report(22, "正在读取 DOC…");
+      return extractDocText(buffer);
+    }
+    if (name.endsWith(".txt") || name.endsWith(".text") || (file.type || "").startsWith("text/")) {
+      report(25, "正在解码文本…");
+      return decodeText(buffer);
+    }
+    throw new Error("暂不支持这个文件格式，请上传 TXT、DOC、DOCX 或 PDF。");
+  }
+
+  function tokenWords(raw) {
+    let token = String(raw || "").toLowerCase().replace(/[’‘]/g, "'").replace(/^['-]+|['-]+$/g, "");
+    if (!token) return [];
+    if (token.includes("'")) {
+      token = token.replace(/'s$/, "").replace(/s'$/, "").replace(/'$/, "");
+      if (token.includes("'")) return [];
+    }
+    if (token.includes("-")) return token.split("-").filter(Boolean);
+    return [token];
+  }
+
+  // 完形填空的空格标记：___53___、____55____、53 ____、___54、(53)。
+  const GAP_MARK_RE = /_{2,}\s*\d{1,3}\s*_{2,}|_{2,}\s*\d{1,3}\b|\b\d{1,3}\s*_{2,}|\(\s*\d{1,3}\s*\)/g;
+  const GAP_HINT_RE = /_{2,}\s*\d{1,3}|\(\s*\d{1,3}\s*\)/;
+  // 选择题选项标记：A. / B、/ C．/ D)
+  const CHOICE_MARK_RE = /(?:^|[\s、，,（(])([A-D])\s*[.、)．:：]/g;
+
+  // 中文排版里的全角标点（"me．"、"kids，"）会让切句失效，先统一成半角。
+  const FULLWIDTH_PUNCT = {
+    "．": ".", "。": ".", "！": "!", "？": "?", "；": ";", "：": ":",
+    "，": ",", "（": "(", "）": ")", "【": "[", "】": "]", "、": ",",
+  };
+
+  function normalizePunctuation(text) {
+    return String(text || "")
+      .replace(/[．。！？；：，（）、【】]/g, (ch) => FULLWIDTH_PUNCT[ch] || ch)
+      // "details,which" → "details, which"；数字里的 "1,000" 不动。
+      .replace(/([,;:])(?=[A-Za-z"'(])/g, (mark, _p, offset, whole) => (
+        /\d/.test(whole[offset - 1] || "") ? mark : `${mark} `
+      ))
+      .replace(/\.(?=[A-Z"'(])/g, ". ");
+  }
+
+  // 把试卷原文切成句子，后面用原句做单词例句。
+  function splitPaperSentences(text) {
+    const source = normalizePunctuation(String(text || ""))
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\u00a0\u3000]/g, " ")
+      .replace(/[‘’]/g, "'")
+      .replace(/[“”]/g, '"');
+    const lines = source
+      .split(/\n+/)
+      .map((line) => line.replace(/[ \t]+/g, " ").trim())
+      .filter(Boolean);
+
+    // PDF 经常在句子中间换行。下一行以小写字母或空格标记开头时，先接回上一行。
+    const blocks = [];
+    for (const line of lines) {
+      const previous = blocks[blocks.length - 1];
+      if (previous
+        && !/[.!?;:]["')\]]?$/.test(previous)
+        && /^[a-z0-9"'(（_]/.test(line)
+        && previous.length + line.length < 300) {
+        blocks[blocks.length - 1] = `${previous} ${line}`;
+      } else {
+        blocks.push(line);
+      }
+    }
+
+    const sentences = [];
+    const seen = new Set();
+    for (const block of blocks) {
+      const parts = block.match(/[^.!?]+[.!?]+["')\]]*|[^.!?]+$/g) || [block];
+      for (const part of parts) {
+        const sentence = part.replace(/\s+/g, " ").trim();
+        if (sentence.length > 320) continue;
+        // 带空格标记的句子本身就是完形填空的原文，即使很短（"Dad ____53____."）也要留下。
+        if (!GAP_HINT_RE.test(sentence)) {
+          if (sentence.length < 12) continue;
+          if ((sentence.match(/[A-Za-z]/g) || []).length < 6) continue;
+        } else if (sentence.length < 8) {
+          continue;
+        }
+        const words = sentence.split(/\s+/).length;
+        const commas = (sentence.match(/,/g) || []).length;
+        // 逗号分隔的单词表不算例句，避免把 "apple, abandon, ..." 当原句。
+        if (commas >= 3 && words / (commas + 1) < 2.5) continue;
+        const key = sentence.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        sentences.push(sentence);
+      }
+    }
+    return sentences;
+  }
+
+  // 选项行（"55. A. withdraw B. donate C. receive D. appreciate"）没有句子结构，
+  // 不能当例句；但它们能把选项词和原题号对应起来。
+  // 完形填空的空格（___55___）就在同号那句原文里，用它给这些词补例句。
+  function choiceLineGroups(line) {
+    const groups = [];
+    const headRe = /(?:^|\s)(\d{1,3})\s*[.、)．]?\s*(?=[A-D]\s*[.、)．:：])/g;
+    const hits = [];
+    let match;
+    while ((match = headRe.exec(line))) {
+      hits.push({ index: match.index, number: Number(match[1]), end: match.index + match[0].length });
+    }
+    hits.forEach((hit, index) => {
+      const to = index + 1 < hits.length ? hits[index + 1].index : line.length;
+      groups.push({ number: hit.number, text: line.slice(hit.end, to) });
+    });
+    return groups;
+  }
+
+  // 把选项行拆出来：passage 用于切句，choices 记录“词 → 题号”。
+  // 同时兼容一行四选项（"55. A. withdraw B. donate …"）和一字母一行（A. / B. …）。
+  function splitChoiceLines(text) {
+    const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+    const kept = [];
+    const choices = new Map();
+    const record = (number, chunk) => {
+      if (!Number.isFinite(number) || number <= 0) return;
+      const cleaned = String(chunk || "").replace(CHOICE_MARK_RE, " ");
+      for (const raw of cleaned.match(/[A-Za-z][A-Za-z'’\-]*/g) || []) {
+        for (const word of tokenWords(raw)) {
+          if (word.length < 3 || UPLOAD_STOPWORDS.has(word)) continue;
+          const bucket = choices.get(word) || new Set();
+          bucket.add(number);
+          choices.set(word, bucket);
+        }
+      }
+    };
+
+    let lastNumber = 0;
+    let block = null;
+    const flush = () => {
+      if (!block) return;
+      for (const chunk of block.chunks) record(block.number, chunk);
+      block = null;
+    };
+
+    for (const line of lines) {
+      if ((line.match(CHOICE_MARK_RE) || []).length >= 2) {
+        flush();
+        for (const group of choiceLineGroups(line)) record(group.number, group.text);
+        continue;
+      }
+      // 一字母一行：可带题号（"41. A. sold"），也可以只有字母（"A. sold"）。
+      const single = line.match(/^\s*(?:(\d{1,3})\s*[.、)．]?\s*)?([A-D])\s*[.、)．:：]\s*(\S.*)$/);
+      if (single) {
+        const number = single[1] ? Number(single[1]) : lastNumber;
+        if (!block || (single[1] && block.number !== number)) {
+          flush();
+          block = { number, chunks: [] };
+        }
+        block.chunks.push(single[3]);
+        continue;
+      }
+      flush();
+      const bare = line.match(/^\s*(\d{1,3})\s*[.、)．]?\s*$/);
+      if (bare) lastNumber = Number(bare[1]);
+      kept.push(line);
+    }
+    flush();
+    return { passage: kept.join("\n"), choices };
+  }
+
+  // 题号 → 原文里含该空格的句子下标。
+  function buildClozeGaps(sentences) {
+    const gaps = new Map();
+    sentences.forEach((sentence, index) => {
+      for (const mark of sentence.match(GAP_MARK_RE) || []) {
+        const digits = mark.match(/\d{1,3}/);
+        if (!digits) continue;
+        const number = Number(digits[0]);
+        const previous = gaps.get(number);
+        if (previous == null || sentenceScore(sentence) > sentenceScore(sentences[previous])) {
+          gaps.set(number, index);
+        }
+      }
+    });
+    return gaps;
+  }
+
+  // 空格所在句常常很短（"Dad ____53____."），接上下一句把上下文补足。
+  function clozeSentenceText(sentences, index) {
+    let text = sentences[index] || "";
+    if (!text) return "";
+    let next = index + 1;
+    while (text.split(/\s+/).length < 5 && next < sentences.length && text.length < 220) {
+      const addition = sentences[next];
+      if (!addition || text.length + addition.length > 260) break;
+      text = `${text} ${addition}`;
+      next += 1;
+    }
+    return text;
+  }
+
+  function sentenceScore(sentence) {
+    const text = String(sentence || "").trim();
+    if (!text) return -1;
+    const words = text.split(/\s+/).length;
+    if (words < 4) return -1;
+    let score = 0;
+    if (text.length >= 30 && text.length <= 180) score += 3;
+    else if (text.length <= 260) score += 1;
+    if (/[.!?]["')\]]?$/.test(text)) score += 1;
+    if (words >= 6) score += 1;
+    const commas = (text.match(/,/g) || []).length;
+    if (commas >= 3 && words / (commas + 1) < 2.5) score -= 2;
+    if (/\b[A-D][.)]\s/.test(text)) score -= 2;
+    if (/_{2,}|\(\s*\)/.test(text)) score -= 1;
+    return score;
+  }
+
+  function extractWordTokens(text) {
+    const seen = new Map();
+    const add = (value) => {
+      let word = String(value || "").toLowerCase().replace(/[^a-z]/g, "");
+      if (word.length < 3 || word.length > 32) return;
+      if (UPLOAD_STOPWORDS.has(word)) return;
+      seen.set(word, (seen.get(word) || 0) + 1);
+    };
+    const consume = (block) => {
+      const matches = String(block || "").match(/[A-Za-z][A-Za-z'’\-]*/g) || [];
+      for (const raw of matches) {
+        for (const word of tokenWords(raw)) add(word);
+      }
+    };
+    consume(text);
+
+    const { passage, choices } = splitChoiceLines(text);
+    const sentences = splitPaperSentences(passage);
+    const gaps = buildClozeGaps(sentences);
+    const sentenceMap = new Map();
+    const sentenceScores = sentences.map(sentenceScore);
+    sentences.forEach((sentence, index) => {
+      // 分数为负的多半是选项行碎片（"hesitated D."），不能当例句。
+      if (sentenceScores[index] < 0) return;
+      const matches = sentence.match(/[A-Za-z][A-Za-z'’\-]*/g) || [];
+      for (const raw of matches) {
+        for (const word of tokenWords(raw)) {
+          const current = sentenceMap.get(word);
+          if (current == null || sentenceScores[index] > sentenceScores[current]) {
+            sentenceMap.set(word, index);
+          }
+        }
+      }
+    });
+
+    return {
+      tokens: Array.from(seen, ([word, freq]) => {
+        const sentence = sentenceMap.has(word) ? sentenceMap.get(word) : -1;
+        let cloze = -1;
+        let clozeNo = 0;
+        if (sentence < 0 && choices.has(word)) {
+          for (const number of choices.get(word)) {
+            const index = gaps.get(number);
+            if (index == null || index < 0) continue;
+            if (cloze < 0) {
+              cloze = index;
+              clozeNo = number;
+            }
+          }
+        }
+        return { word, freq, sentence, cloze, clozeNo };
+      }),
+      sentences,
+    };
+  }
+
+  function betterSentence(a, b, sentences) {
+    if (a == null || a < 0) return b == null ? -1 : b;
+    if (b == null || b < 0) return a;
+    return sentenceScore(sentences[b]) > sentenceScore(sentences[a]) ? b : a;
+  }
+
+  function matchUploadTokens(tokens, index, sentences = []) {
+    const matched = new Map();
+    for (const token of tokens) {
+      const candidates = lemmaCandidates(token.word);
+      let best = null;
+      for (const candidate of candidates) {
+        const mask = index[candidate];
+        if (mask == null) continue;
+        const library = lowestLibrary(mask);
+        const level = library ? LIBRARY_LEVELS.indexOf(library) : LIBRARY_LEVELS.length;
+        const score = level * 10 + (candidate === token.word ? 0 : 1);
+        if (!best || score < best.score) best = { word: candidate, mask, score };
+      }
+      if (!best) continue;
+      const previous = matched.get(best.word);
+      if (previous) {
+        previous.freq += token.freq;
+        previous.sentence = betterSentence(previous.sentence, token.sentence, sentences);
+        if (token.cloze >= 0 && previous.cloze < 0) {
+          previous.cloze = token.cloze;
+          previous.clozeNo = token.clozeNo;
+        }
+      } else {
+        matched.set(best.word, {
+          word: best.word,
+          mask: best.mask,
+          freq: token.freq,
+          sentence: token.sentence == null ? -1 : token.sentence,
+          cloze: token.cloze == null ? -1 : token.cloze,
+          clozeNo: token.clozeNo || 0,
+        });
+      }
+    }
+    return Array.from(matched.values());
+  }
+
+  function findLoadedEntry(word) {
+    for (const library of LIBRARY_LEVELS) {
+      const book = state.books[library.id];
+      if (!book || !book._index) continue;
+      const index = book._index.get(word);
+      if (index != null && index >= 0) return book.words[index];
+    }
+    return null;
+  }
+
+  function buildUploadEntries(matched, dict, sentences = []) {
+    const entries = matched.map((item) => {
+      const loaded = findLoadedEntry(item.word);
+      const fromDict = dict && dict[item.word] ? dict[item.word] : null;
+      const library = lowestLibrary(item.mask);
+      const direct = item.sentence >= 0 && sentences[item.sentence] ? sentences[item.sentence] : "";
+      // 只在选项里出现过的词：用同号空格所在的原文当例句（句子本身保留空格）。
+      const cloze = !direct && item.cloze >= 0 ? clozeSentenceText(sentences, item.cloze) : "";
+      const sentence = direct || cloze;
+      const entry = {
+        w: item.word,
+        p: (loaded && loaded.p) || (fromDict && fromDict[0]) || "",
+        m: (loaded && loaded.m) || (fromDict && fromDict[1]) || "暂无释义",
+        lib: library ? library.id : "",
+        beyond: !(item.mask & 1),
+        freq: item.freq,
+      };
+      if (sentence) {
+        entry.e = sentence;
+        entry.t = "";
+        entry.paper = true;
+        if (!direct && item.clozeNo) entry.cn = item.clozeNo;
+      }
+      return entry;
+    });
+    entries.sort((a, b) => (
+      (a.beyond ? 1 : 0) - (b.beyond ? 1 : 0) ||
+      (b.freq || 0) - (a.freq || 0) ||
+      a.w.localeCompare(b.w)
+    ));
+    return entries;
+  }
+
+  function mergeUpload(entries, fileName, options = {}) {
+    const now = Date.now();
+    const existing = state.upload && Array.isArray(state.upload.words) ? state.upload : null;
+    const byWord = new Map();
+    if (existing) {
+      for (const entry of existing.words) byWord.set(entry.w, { ...entry });
+    }
+    let added = 0;
+    for (const entry of entries) {
+      const previous = byWord.get(entry.w);
+      if (!previous) {
+        byWord.set(entry.w, entry);
+        added += 1;
+        continue;
+      }
+      previous.freq = (previous.freq || 0) + (entry.freq || 0);
+      if ((!previous.m || previous.m === "暂无释义") && entry.m) {
+        previous.m = entry.m;
+        previous.p = entry.p;
+      }
+      // 旧例句可能是选项行碎片（"hesitated D."）；新例句更像完整句子时换上。
+      const weakExample = !previous.e || String(previous.e).trim().split(/\s+/).length < 4;
+      if (entry.e && (weakExample || (entry.paper && !previous.paper))) {
+        previous.e = entry.e;
+        previous.t = entry.t || "";
+        previous.paper = Boolean(entry.paper);
+        previous.cn = entry.cn || 0;
+      }
+    }
+    const all = Array.from(byWord.values()).sort((a, b) => (
+      (a.beyond ? 1 : 0) - (b.beyond ? 1 : 0) ||
+      (b.freq || 0) - (a.freq || 0) ||
+      a.w.localeCompare(b.w)
+    ));
+    const words = all.slice(0, UPLOAD_MAX_WORDS);
+    const files = existing && Array.isArray(existing.files) ? existing.files.slice() : [];
+    // 手动加入的词没有“试卷”来源，不记到 files 里。
+    if (!options.manual && fileName) files.unshift({ name: fileName, at: now, added, matched: entries.length });
+    return {
+      upload: {
+        version: 1,
+        createdAt: (existing && existing.createdAt) || now,
+        updatedAt: now,
+        files: files.slice(0, 20),
+        words,
+      },
+      added,
+      truncated: all.length > UPLOAD_MAX_WORDS,
+    };
+  }
+
+  /* ---------------- 单词 → 个人词汇 ---------------- */
+  function inPersonalWords(word) {
+    const key = String(word || "").toLowerCase();
+    if (!key || !state.upload || !Array.isArray(state.upload.words)) return false;
+    return state.upload.words.some((entry) => entry.w === key);
+  }
+
+  // 题目里的词条（可能来自任意词库）转成个人词汇的存法。
+  function personalEntryFrom(entry) {
+    const word = String((entry && entry.w) || "").toLowerCase();
+    if (!word) return null;
+    const mask = (state.wordIndex && state.wordIndex[word]) || 0;
+    const library = entry.lib && LIBRARY_BY_ID[entry.lib] ? LIBRARY_BY_ID[entry.lib] : lowestLibrary(mask);
+    const out = {
+      w: word,
+      p: entry.p || "",
+      m: entry.m || "暂无释义",
+      lib: library ? library.id : "",
+      beyond: typeof entry.beyond === "boolean" ? entry.beyond : !(mask & 1),
+      freq: 1,
+    };
+    if (entry.e) {
+      out.e = entry.e;
+      out.t = entry.t || "";
+      out.paper = Boolean(entry.paper);
+      if (entry.cn) out.cn = entry.cn;
+    }
+    return out;
+  }
+
+  // 反馈卡里的那一个按钮：没在个人词汇里就是“加入”，已经在里面就是“移出”。
+  // 注意不要带 data-word：document 上的查词监听会把它当成“点单词查释义”。
+  function personalButtonHTML(word) {
+    const added = inPersonalWords(word);
+    return `<button class="personal-btn${added ? " is-added" : ""}" type="button" data-personal-toggle>${added
+      ? `${ICONS.minus} 从个人词汇中移出`
+      : `${ICONS.plus} 加入个人词汇`}</button>`;
+  }
+
+  function setPersonalButtonState(button, added) {
+    if (!button) return;
+    button.classList.toggle("is-added", Boolean(added));
+    button.innerHTML = added ? `${ICONS.minus} 从个人词汇中移出` : `${ICONS.plus} 加入个人词汇`;
+  }
+
+  function addWordToPersonal(entry, button) {
+    const item = personalEntryFrom(entry);
+    if (!item) return;
+    if (inPersonalWords(item.w)) {
+      setPersonalButtonState(button, true);
+      toast(`「${item.w}」已经在个人词汇里了`);
+      return;
+    }
+    try {
+      const result = mergeUpload([item], "", { manual: true });
+      saveUpload(result.upload);
+      state.upload = result.upload;
+      invalidateUploadBook();
+      syncUploadBookMeta();
+      // 新词要能进练习范围：范围和词表重排序对不上，直接放开成全部。
+      delete store.settings.ranges[UPLOAD_BOOK_ID];
+      saveStore();
+      if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
+      else if (!ui.session) renderCurrent();
+      setPersonalButtonState(button, true);
+      toast(`「${item.w}」已加入个人词汇 · 共 ${uploadStats().total} 词`);
+    } catch (error) {
+      console.warn("Failed to add personal word", error);
+      toast(error && error.message ? error.message : "加入个人词汇失败", true);
+    }
+  }
+
+  function removeWordFromPersonal(word, button) {
+    const key = String(word || "").toLowerCase();
+    const upload = state.upload;
+    if (!key || !upload || !Array.isArray(upload.words)) return;
+    const remaining = upload.words.filter((item) => item.w !== key);
+    if (remaining.length === upload.words.length) {
+      setPersonalButtonState(button, false);
+      return;
+    }
+    const progress = store.progress[UPLOAD_BOOK_ID];
+    if (progress) delete progress[key];
+
+    if (!remaining.length) {
+      // 最后一个词被移出：整个个人词汇一起清掉，回到高考词库
+      try {
+        localStorage.removeItem(UPLOAD_KEY);
+      } catch (error) {
+        console.warn(error);
+      }
+      state.upload = null;
+      invalidateUploadBook();
+      delete store.progress[UPLOAD_BOOK_ID];
+      delete store.settings.ranges[UPLOAD_BOOK_ID];
+      for (const day of Object.values(store.daily)) {
+        if (day && day.newByBook) delete day.newByBook[UPLOAD_BOOK_ID];
+      }
+      if (store.settings.bookId === UPLOAD_BOOK_ID) store.settings.bookId = "gaokao";
+      saveStore();
+      syncUploadBookMeta();
+      setPersonalButtonState(button, false);
+      ensureCurrentBook().catch(() => {});
+      toast(`「${key}」已移出，个人词汇已清空`);
+      return;
+    }
+
+    upload.words = remaining;
+    upload.updatedAt = Date.now();
+    try {
+      saveUpload(upload);
+    } catch (error) {
+      toast(error && error.message ? error.message : "保存失败", true);
+      return;
+    }
+    invalidateUploadBook();
+    syncUploadBookMeta();
+    saveStore();
+    if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
+    else if (!ui.session) renderCurrent();
+    setPersonalButtonState(button, false);
+    toast(`「${key}」已从个人词汇移出 · 还剩 ${remaining.length} 词`);
+  }
+
+  function togglePersonalWord(entry, button) {
+    const word = String((entry && entry.w) || "").toLowerCase();
+    if (!word) return;
+    if (inPersonalWords(word)) removeWordFromPersonal(word, button);
+    else addWordToPersonal(entry, button);
+  }
+
+  async function handleUploadFile(file) {
+    if (!file || ui.uploadBusy) return;
+    ui.uploadBusy = true;
+    ui.uploadDraft = null;
+    try {
+      if (file.size > 30 * 1024 * 1024) {
+        throw new Error("文件超过 30 MB，请先拆分或压缩后再上传。");
+      }
+      showUploadProgress(file.name);
+      setUploadStatus("正在读取文件…", 5);
+      const buffer = await file.arrayBuffer();
+      const text = await extractTextFromFile(file, buffer, (pct, label) => setUploadStatus(label, pct));
+      setUploadStatus("正在提取英文单词…", 56);
+      const { tokens, sentences } = extractWordTokens(text);
+      if (!tokens.length) {
+        throw new Error("没有提取到可学习的英文词汇。如果是扫描版 PDF，请先用 OCR 转成文字版。");
+      }
+      setUploadStatus("正在匹配四套词库…", 66);
+      const index = await ensureWordIndex();
+      setUploadStatus("正在读取释义…", 74);
+      const dict = await loadDict();
+      const matched = matchUploadTokens(tokens, index, sentences);
+      if (!matched.length) {
+        throw new Error(`从文件中识别出 ${tokens.length} 个英文词，但没有匹配到高考或更高阶词库中的词汇。`);
+      }
+      setUploadStatus("正在整理词汇…", 88);
+      const entries = buildUploadEntries(matched, dict, sentences);
+      showUploadSelection(entries, file.name);
+    } catch (error) {
+      console.warn("Upload failed", error);
+      showUploadError(error && error.message ? error.message : "文件处理失败，请换一个文件再试。");
+    } finally {
+      ui.uploadBusy = false;
+    }
+  }
+
+  function uploadPickItemHTML(entry, checked) {
+    const library = affiliationFor(entry.w, entry);
+    return `
+      <label class="upload-pick-item">
+        <input type="checkbox" data-upload-select value="${escAttr(entry.w)}" ${checked ? "checked" : ""}>
+        <span class="upload-pick-copy">
+          <span class="upload-pick-word">
+            <strong>${esc(entry.w)}</strong>
+            ${library ? `<span class="lib-tag lib-${escAttr(library.id)}">${esc(library.short)}</span>` : ""}
+            ${entry.existing ? `<span class="pick-existing">已收录</span>` : ""}
+          </span>
+          <small>${esc(shortMeaning(entry.m))}</small>
+          ${entry.e ? `<em>${entry.cn ? `第 ${entry.cn} 题空格 · ` : ""}${esc(entry.e)}</em>` : ""}
+        </span>
+      </label>`;
+  }
+
+  // 按词汇类别分组。
+  function uploadGroups(entries) {
+    const groups = LIBRARY_LEVELS.map((library) => ({
+      title: `${library.short}词汇`,
+      items: entries.filter((entry) => {
+        const found = affiliationFor(entry.w, entry);
+        return found && found.id === library.id;
+      }),
+    })).filter((group) => group.items.length);
+    const rest = entries.filter((entry) => !affiliationFor(entry.w, entry));
+    if (rest.length) groups.push({ title: "其他词汇", items: rest });
+    return groups;
+  }
+
+  function uploadPickSectionsHTML(entries, selected) {
+    return uploadGroups(entries).map((group) => `
+      <div class="upload-section">
+        <div class="upload-section-head"><h3>${group.title}</h3><span>${group.items.length} 词</span></div>
+        <div class="upload-pick-list">
+          ${group.items.map((entry) => uploadPickItemHTML(entry, selected.has(entry.w))).join("")}
+        </div>
+      </div>`).join("");
+  }
+
+  function showUploadSelection(entries, fileName) {
+    const existing = new Set(((state.upload && state.upload.words) || []).map((entry) => entry.w));
+    for (const entry of entries) entry.existing = existing.has(entry.w);
+    const selected = new Set(entries.map((entry) => entry.w));
+    ui.uploadDraft = { entries, fileName, selected, anchorIndex: null };
+    const count = entries.length;
+    openSheet(`
+      ${sheetHead("选择要加入的词", `${fileName} · 识别到 ${count} 词`)}
+      <div class="upload-pick-bar">
+        <span class="upload-pick-count" id="uploadPickCount"><strong>${count}</strong> / ${count} 词</span>
+        <span class="upload-pick-tools">
+          <button class="mini-btn" type="button" data-upload-all>全选</button>
+          <button class="mini-btn" type="button" data-upload-none>全不选</button>
+        </span>
+      </div>
+      <div class="sheet-note">取消勾选不想加入的词。Shift 连选；按住拖动可批量勾选。例句使用试卷原句。</div>
+      <div class="upload-pick-actions">
+        <button class="primary-btn" type="button" data-upload-confirm>加入 ${count} 词</button>
+        <button class="ghost-btn" type="button" data-pick-upload>换一个文件</button>
+      </div>
+      <div class="upload-pick-scroll">
+        ${uploadPickSectionsHTML(entries, selected)}
+      </div>
+    `, { maximized: true, focus: false });
+  }
+
+  // 学习范围里点「个人词汇」卡片：列出已加入的词，勾选要删的那几个。
+  function uploadManageItemHTML(entry, checked) {
+    const library = affiliationFor(entry.w, entry);
+    return `
+      <label class="upload-pick-item">
+        <input type="checkbox" data-upload-select value="${escAttr(entry.w)}" ${checked ? "checked" : ""}>
+        <span class="upload-pick-copy">
+          <span class="upload-pick-word">
+            <strong>${esc(entry.w)}</strong>
+            ${library ? `<span class="lib-tag lib-${escAttr(library.id)}">${esc(library.short)}</span>` : ""}
+          </span>
+          <small>${esc(shortMeaning(entry.m))}</small>
+          ${entry.e ? `<em>${entry.cn ? `第 ${entry.cn} 题空格 · ` : ""}${esc(entry.e)}</em>` : ""}
+        </span>
+      </label>`;
+  }
+
+  function deleteSelectedUploadWords() {
+    const draft = ui.uploadDraft;
+    const upload = state.upload;
+    if (!draft || draft.mode !== "delete" || !upload || !draft.selected.size) return;
+    const remove = draft.selected;
+    const remaining = upload.words.filter((entry) => !remove.has(entry.w));
+    const removed = upload.words.length - remaining.length;
+    const progress = store.progress[UPLOAD_BOOK_ID];
+    if (progress) for (const word of remove) delete progress[word];
+    closeSheet();
+
+    if (!remaining.length) {
+      // 全删完了：整个个人词汇一起清掉，回到高考词库
+      try {
+        localStorage.removeItem(UPLOAD_KEY);
+      } catch (error) {
+        console.warn(error);
+      }
+      state.upload = null;
+      invalidateUploadBook();
+      delete store.progress[UPLOAD_BOOK_ID];
+      delete store.settings.ranges[UPLOAD_BOOK_ID];
+      for (const day of Object.values(store.daily)) {
+        if (day && day.newByBook) delete day.newByBook[UPLOAD_BOOK_ID];
+      }
+      if (store.settings.bookId === UPLOAD_BOOK_ID) store.settings.bookId = "gaokao";
+      saveStore();
+      syncUploadBookMeta();
+      renderCurrent();
+      ensureCurrentBook().catch(() => {});
+      toast(`已删除 ${removed} 个词，个人词汇已清空`);
+      return;
+    }
+
+    upload.words = remaining;
+    upload.updatedAt = Date.now();
+    try {
+      saveUpload(upload);
+    } catch (error) {
+      toast(error && error.message ? error.message : "保存失败", true);
+      return;
+    }
+    invalidateUploadBook();
+    syncUploadBookMeta();
+    saveStore();
+    renderCurrent();
+    ensureCurrentBook().catch(() => {});
+    toast(`已删除 ${removed} 个词`);
+  }
+
+  function updateUploadPickCount() {
+    const draft = ui.uploadDraft;
+    if (!draft) return;
+    const count = draft.selected.size;
+    const total = draft.entries.length;
+    const label = $("#uploadPickCount");
+    if (label) label.innerHTML = `<strong>${count}</strong> / ${total} 词`;
+    if (draft.mode === "delete") {
+      const remove = $("[data-upload-delete]", $("#sheetContent"));
+      if (remove) {
+        remove.disabled = count === 0;
+        remove.textContent = count ? `删除 ${count} 词` : "删除选中";
+      }
+      return;
+    }
+    const confirm = $("[data-upload-confirm]", $("#sheetContent"));
+    if (confirm) {
+      confirm.disabled = count === 0;
+      confirm.textContent = count ? `加入 ${count} 词` : "请选择词汇";
+    }
+  }
+
+  function setUploadSelection(all) {
+    const draft = ui.uploadDraft;
+    if (!draft) return;
+    draft.selected = all ? new Set(draft.entries.map((entry) => entry.w)) : new Set();
+    draft.anchorIndex = null;
+    $$("[data-upload-select]", $("#sheetContent")).forEach((input) => {
+      input.checked = all;
+    });
+    updateUploadPickCount();
+  }
+
+  function uploadPickInputs() {
+    return $$("[data-upload-select]", $("#sheetContent"));
+  }
+
+  function setUploadPickInput(input, checked) {
+    if (!input || !ui.uploadDraft) return;
+    if (input.checked !== checked) input.checked = checked;
+    if (checked) ui.uploadDraft.selected.add(input.value);
+    else ui.uploadDraft.selected.delete(input.value);
+  }
+
+  function uploadPickInputAt(x, y) {
+    const el = document.elementFromPoint(x, y);
+    const item = el && el.closest ? el.closest(".upload-pick-item") : null;
+    return item ? $("[data-upload-select]", item) : null;
+  }
+
+  function paintUploadDragAt(x, y) {
+    const drag = ui.uploadDrag;
+    if (!drag || !ui.uploadDraft) return false;
+    const input = uploadPickInputAt(x, y);
+    if (!input) return false;
+    if (input.checked !== drag.value) {
+      setUploadPickInput(input, drag.value);
+      drag.applied = true;
+      updateUploadPickCount();
+    }
+    return true;
+  }
+
+  function uploadDragTick() {
+    const drag = ui.uploadDrag;
+    if (!drag || !drag.active) return;
+    const scroller = $(".upload-pick-scroll", $("#sheetContent"));
+    if (scroller) {
+      const rect = scroller.getBoundingClientRect();
+      const edge = Math.min(56, rect.height * 0.28);
+      let delta = 0;
+      if (drag.y < rect.top + edge) delta = -Math.max(3, Math.ceil((rect.top + edge - drag.y) / 3));
+      else if (drag.y > rect.bottom - edge) delta = Math.max(3, Math.ceil((drag.y - (rect.bottom - edge)) / 3));
+      if (delta) {
+        const before = scroller.scrollTop;
+        scroller.scrollTop = clamp(scroller.scrollTop + delta, 0, scroller.scrollHeight);
+        if (scroller.scrollTop !== before) paintUploadDragAt(drag.x, drag.y);
+      }
+    }
+    drag.raf = requestAnimationFrame(uploadDragTick);
+  }
+
+  function beginUploadDrag(event) {
+    if (!ui.uploadDraft) return;
+    if (event.button != null && event.button !== 0) return;
+    const item = event.target.closest(".upload-pick-item");
+    if (!item) return;
+    const input = $("[data-upload-select]", item);
+    if (!input) return;
+    const isMouse = event.pointerType === "mouse" || !event.pointerType;
+    const drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      x: event.clientX,
+      y: event.clientY,
+      value: !input.checked,
+      active: isMouse,
+      moved: false,
+      applied: false,
+      timer: 0,
+      raf: 0,
+    };
+    if (!isMouse) {
+      // 触摸时从复选框直接拖动，或在词条上按住约 0.3 秒后进入多选。
+      if (event.target.closest("input")) {
+        drag.active = true;
+      } else {
+        drag.timer = window.setTimeout(() => {
+          if (ui.uploadDrag !== drag) return;
+          drag.timer = 0;
+          drag.active = true;
+          drag.applied = true;
+          try { if (navigator.vibrate) navigator.vibrate(8); } catch (error) { /* ignore */ }
+          paintUploadDragAt(drag.x, drag.y);
+          if (!drag.raf) drag.raf = requestAnimationFrame(uploadDragTick);
+        }, 320);
+      }
+    }
+    ui.uploadDrag = drag;
+  }
+
+  function moveUploadDrag(event) {
+    const drag = ui.uploadDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag.x = event.clientX;
+    drag.y = event.clientY;
+    if (!drag.moved && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 6) {
+      drag.moved = true;
+    }
+    if (!drag.active) {
+      if (!drag.moved) return;
+      if (drag.timer) {
+        clearTimeout(drag.timer);
+        drag.timer = 0;
+      }
+      // 触摸在长按生效前移动，视为滚动，不进入多选。
+      if (event.pointerType !== "mouse") {
+        ui.uploadDrag = null;
+        return;
+      }
+      drag.active = true;
+    }
+    if (!drag.moved) return;
+    if (drag.timer) {
+      clearTimeout(drag.timer);
+      drag.timer = 0;
+    }
+    if (event.cancelable) event.preventDefault();
+    paintUploadDragAt(event.clientX, event.clientY);
+    if (!drag.raf) drag.raf = requestAnimationFrame(uploadDragTick);
+  }
+
+  function moveUploadTouch(event) {
+    const drag = ui.uploadDrag;
+    if (!drag || !drag.active || !drag.moved) return;
+    const touch = event.touches && event.touches[0];
+    if (!touch) return;
+    drag.x = touch.clientX;
+    drag.y = touch.clientY;
+    if (event.cancelable) event.preventDefault();
+    paintUploadDragAt(drag.x, drag.y);
+    if (!drag.raf) drag.raf = requestAnimationFrame(uploadDragTick);
+  }
+
+  function endUploadDrag(event) {
+    const drag = ui.uploadDrag;
+    if (!drag) return;
+    if (event && drag.pointerId != null && event.pointerId != null && event.pointerId !== drag.pointerId) return;
+    if (drag.timer) clearTimeout(drag.timer);
+    if (drag.raf) cancelAnimationFrame(drag.raf);
+    if (drag.active && drag.applied) ui.uploadSuppressClick = Date.now() + 400;
+    ui.uploadDrag = null;
+  }
+
+  function handleUploadPickClick(event) {
+    const input = event.target.closest("[data-upload-select]");
+    if (!input || !ui.uploadDraft) return;
+    if (ui.uploadSuppressClick && Date.now() < ui.uploadSuppressClick) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    const inputs = uploadPickInputs();
+    const index = inputs.indexOf(input);
+    if (index < 0) return;
+    const draft = ui.uploadDraft;
+    if (event.shiftKey && draft.anchorIndex != null) {
+      const checked = input.checked;
+      const start = Math.min(draft.anchorIndex, index);
+      const end = Math.max(draft.anchorIndex, index);
+      for (let i = start; i <= end; i += 1) setUploadPickInput(inputs[i], checked);
+      updateUploadPickCount();
+      return;
+    }
+    draft.anchorIndex = index;
+  }
+
+  async function confirmUploadSelection() {
+    const draft = ui.uploadDraft;
+    if (!draft || ui.uploadBusy) return;
+    const entries = draft.entries
+      .filter((entry) => draft.selected.has(entry.w))
+      .map(({ existing, ...entry }) => entry);
+    if (!entries.length) {
+      toast("至少选择一个词", true);
+      return;
+    }
+    ui.uploadBusy = true;
+    try {
+      const result = mergeUpload(entries, draft.fileName);
+      saveUpload(result.upload);
+      state.upload = result.upload;
+      invalidateUploadBook();
+      syncUploadBookMeta();
+      store.settings.bookId = UPLOAD_BOOK_ID;
+      delete store.settings.ranges[UPLOAD_BOOK_ID];
+      saveStore();
+      ui.uploadDraft = null;
+      await ensureBook(UPLOAD_BOOK_ID);
+      renderCurrent();
+      showUploadResult(result.upload, result.added, draft.fileName, result.truncated, entries.length);
+    } catch (error) {
+      console.warn("Upload save failed", error);
+      toast(error && error.message ? error.message : "保存个人词汇失败", true);
+    } finally {
+      ui.uploadBusy = false;
+    }
+  }
+
+  function uploadWordHTML(entry) {
+    const library = affiliationFor(entry.w, entry);
+    return `
+      <button class="upload-word" type="button" data-word="${escAttr(entry.w)}">
+        <span class="upload-word-main">
+          <strong>${esc(entry.w)}</strong>
+          <small>${esc(shortMeaning(entry.m))}</small>
+        </span>
+        <span class="upload-word-tags">
+          ${library ? `<span class="lib-tag lib-${escAttr(library.id)}">${esc(library.short)}</span>` : ""}
+        </span>
+      </button>`;
+  }
+
+  function uploadSectionsHTML(upload) {
+    const words = (upload && upload.words) || [];
+    const section = (title, items) => items.length ? `
+      <div class="upload-section">
+        <div class="upload-section-head"><h3>${title}</h3><span>${items.length} 词</span></div>
+        <div class="upload-word-list">${items.map(uploadWordHTML).join("")}</div>
+      </div>` : "";
+    return uploadGroups(words).map((group) => section(group.title, group.items)).join("");
+  }
+
+  // 管理弹层里的词条：可勾选（勾中的会被删掉），同样按词汇类别分组。
+  function uploadManageSectionsHTML(entries) {
+    return uploadGroups(entries).map((group) => `
+      <div class="upload-section">
+        <div class="upload-section-head"><h3>${group.title}</h3><span>${group.items.length} 词</span></div>
+        <div class="upload-pick-list">
+          ${group.items.map((entry) => uploadManageItemHTML(entry, false)).join("")}
+        </div>
+      </div>`).join("");
+  }
+
+  function showUploadResult(upload, added, fileName, truncated = false, selected = added) {
+    const stats = uploadStats(upload);
+    const subtitle = selected === added
+      ? `${fileName} · 本次加入 ${added} 词`
+      : `${fileName} · 选择 ${selected} 词 · 新增 ${added} 词`;
+    openSheet(`
+      ${sheetHead("提取完成", subtitle)}
+      ${uploadSummaryHTML(stats)}
+      <div class="upload-actions">
+        <button class="primary-btn" type="button" data-upload-practice>用个人词汇练习</button>
+        <button class="ghost-btn" type="button" data-pick-upload>继续上传</button>
+      </div>
+      <div class="sheet-note">已加入学习范围最前面的「个人词汇」。题目右上角显示词汇类别；同一词同时属于多个词库时，只显示最基础的归属。</div>
+      ${truncated ? `<div class="sheet-note">词汇超过 ${UPLOAD_MAX_WORDS} 个，只保留前 ${UPLOAD_MAX_WORDS} 个。</div>` : ""}
+      ${uploadSectionsHTML(upload)}
+    `);
+  }
+
+  function showUploadError(message) {
+    openSheet(`
+      ${sheetHead("上传失败", "没有生成新的词汇")}
+      <div class="empty-state" style="padding:22px 12px 16px">
+        <div class="empty-icon">!</div>
+        <h3>这次没有提取成功</h3>
+        <p>${esc(message)}</p>
+        <button class="primary-btn" type="button" data-pick-upload>换一个文件</button>
+        <button class="ghost-btn" type="button" data-close-sheet>关闭</button>
+      </div>
+      <div class="sheet-note">TXT 最稳定；DOCX 和文字版 PDF 通常可以直接读取；扫描版 PDF 需要先 OCR。</div>
+    `);
+  }
+
+  function openUploadManageSheet() {
+    if (!state.upload || !state.upload.words.length) {
+      openSheet(`
+        ${sheetHead("个人词汇", "还没有收过词")}
+        <div class="empty-state" style="padding:22px 12px 16px">
+          <div class="empty-icon">${ICONS.upload}</div>
+          <h3>两种加法</h3>
+          <p>答题后点「加入个人词汇」，一个词一个词攒；或者上传一份试卷，批量提取后勾选要加入的词。</p>
+          <button class="primary-btn" type="button" data-pick-upload>上传试卷</button>
+        </div>
+      `);
+      return;
+    }
+    const stats = uploadStats();
+    const files = (state.upload.files || []).length;
+    const words = state.upload.words;
+    const subtitle = files ? `${stats.total} 词 · 来自 ${files} 份试卷` : `${stats.total} 词 · 答题时逐个加入`;
+    // 这个弹层同时是「管理」：勾选词条就能删掉不想要的词。
+    ui.uploadDraft = { mode: "delete", entries: words, selected: new Set(), anchorIndex: null };
+    openSheet(`
+      ${sheetHead("个人词汇", subtitle)}
+      ${uploadSummaryHTML(stats)}
+      <div class="upload-actions">
+        <button class="primary-btn" type="button" data-upload-practice>开始练习</button>
+        <button class="ghost-btn" type="button" data-pick-upload>继续上传</button>
+        <button class="mini-btn danger" type="button" data-upload-clear>清空</button>
+      </div>
+      <div class="upload-pick-bar">
+        <span class="upload-pick-count" id="uploadPickCount"><strong>0</strong> / ${words.length} 词</span>
+        <span class="upload-pick-tools">
+          <button class="mini-btn" type="button" data-upload-all>全选</button>
+          <button class="mini-btn" type="button" data-upload-none>全不选</button>
+          <button class="mini-btn danger" type="button" data-upload-delete disabled>删除选中</button>
+        </span>
+      </div>
+      <div class="sheet-note">勾选要删除的词，再点「删除选中」。Shift 连选；按住拖动可批量勾选。</div>
+      <div class="upload-pick-scroll is-delete-mode">
+        ${uploadManageSectionsHTML(words)}
+      </div>
+    `, { maximized: true, focus: false });
+    updateUploadPickCount();
+  }
+
+  async function activateUploadBook() {
+    if (!state.upload || !state.upload.words.length) {
+      toast("个人词汇还是空的");
+      return;
+    }
+    syncUploadBookMeta();
+    store.settings.bookId = UPLOAD_BOOK_ID;
+    saveStore();
+    closeSheet();
+    renderCurrent();
+    try {
+      await ensureCurrentBook();
+      prewarmRelations(currentBook());
+      // 等底部弹层收起的动画结束再开始，避免第一下点击被弹层挡住。
+      window.setTimeout(() => {
+        startSession("zh2en").catch(() => {});
+      }, 320);
+    } catch (error) {
+      console.warn(error);
+      toast("个人词汇加载失败", true);
+    }
+  }
+
+  function clearUpload() {
+    if (!state.upload) return;
+    if (!confirm("确定清空个人词汇吗？这些词和「个人词汇」的练习进度都会删除。")) return;
+    try {
+      localStorage.removeItem(UPLOAD_KEY);
+    } catch (error) {
+      console.warn(error);
+    }
+    state.upload = null;
+    invalidateUploadBook();
+    delete store.progress[UPLOAD_BOOK_ID];
+    delete store.settings.ranges[UPLOAD_BOOK_ID];
+    for (const day of Object.values(store.daily)) {
+      if (day && day.newByBook) delete day.newByBook[UPLOAD_BOOK_ID];
+    }
+    if (store.settings.bookId === UPLOAD_BOOK_ID) store.settings.bookId = "gaokao";
+    saveStore();
+    syncUploadBookMeta();
+    closeSheet();
+    renderCurrent();
+    ensureCurrentBook().catch(() => {});
+    toast("已清空个人词汇");
+  }
+
   /* ---------------- lookup ---------------- */
   async function openWordSheet(raw) {
     const query = String(raw || "").toLowerCase().replace(/^[^a-z]+|[^a-z]+$/g, "");
@@ -1918,7 +4006,7 @@
     const progress = found ? progressFor(found.book.id)[found.entry.w] : null;
     const inCurrentBook = found && found.book.id === store.settings.bookId;
     const alreadyWrong = Boolean(progress && (progress.wrongCount || 0) > 0 && !progress.mastered);
-    const example = found && found.entry.e && found.entry.t ? found.entry : null;
+    const example = found && found.entry.e ? found.entry : null;
 
     openSheet(`
       ${sheetHead("查词", exact ? "音标 · 释义 · 例句" : `原形：${result.base}`)}
@@ -1932,11 +4020,11 @@
       ${example ? `
         <div class="lookup-example">
           <div class="example-label">
-            <span>例句 · 点单词可继续查</span>
-            <button class="small-audio" type="button" data-speak="${escAttr(example.e)}">${ICONS.speaker} 朗读</button>
+            <span>${example.paper ? (example.cn ? `试卷原句 · 第${example.cn}题空格` : "试卷原文例句") : "例句"} · 点单词可继续查</span>
+            <button class="small-audio" type="button" data-speak="${escAttr(example.cn ? fillClozeGap(example.e, example.w) : example.e)}">${ICONS.speaker} 朗读</button>
           </div>
-          <div class="example-en">${renderTappable(example.e)}</div>
-          <div class="example-zh">${esc(example.t)}</div>
+          <div class="example-en">${example.paper ? renderPaperExample(example.e) : renderTappable(example.e)}</div>
+          ${example.t ? `<div class="example-zh">${esc(example.t)}</div>` : ""}
         </div>` : ""}
       <div class="lookup-actions">
         ${inCurrentBook
@@ -2813,15 +4901,24 @@
     input.value += key;
   }
 
+  function questionTagsHTML(item) {
+    const entry = item.word;
+    const library = affiliationFor(entry.w, entry);
+    const libraryTag = library
+      ? `<span class="lib-tag lib-${escAttr(library.id)}">${esc(library.short)}</span>`
+      : "";
+    const newTag = item.isNew ? `<span class="new-tag">新词</span>` : "";
+    return `<span class="kicker-tags">${libraryTag}${newTag}</span>`;
+  }
+
   function questionHTML(item) {
     const session = ui.session;
     const entry = item.word;
-    const newTag = item.isNew ? `<span class="new-tag">新词</span>` : "";
     if (session.mode === "zh2en") {
       return `
         <div class="question-card">
           <div class="question-inner">
-            <div class="question-kicker"><span>看中文 · 写英文</span>${newTag}</div>
+            <div class="question-kicker"><span>看中文 · 写英文</span>${questionTagsHTML(item)}</div>
             <div class="prompt-meaning">${posMeaning(entry.m)}</div>
             <div class="prompt-sub">写出对应的英文单词</div>
             <div class="prompt-tools">
@@ -2850,7 +4947,7 @@
     return `
       <div class="question-card">
         <div class="question-inner">
-          <div class="question-kicker"><span>看英文 · 选中文</span>${newTag}</div>
+          <div class="question-kicker"><span>看英文 · 选中文</span>${questionTagsHTML(item)}</div>
           <div class="prompt-word">${esc(entry.w)}</div>
           <div class="phonetic">${entry.p ? `/${esc(entry.p)}/` : ""}</div>
           <div class="prompt-tools">
@@ -3074,14 +5171,20 @@
     const card = $(".question-card", $("#sessionBody"));
     if (!card) return;
 
-    const example = entry.e && entry.t ? `
+    const exampleLabel = entry.paper
+      ? (entry.cn ? `试卷原句 · 第${entry.cn}题空格` : "试卷原文例句")
+      : "例句";
+    // 朗读时把空格填进这个词，读出来才自然；屏幕上仍按原卷显示空格。
+    const exampleSpeak = entry.cn ? fillClozeGap(entry.e, entry.w) : entry.e;
+    const example = entry.e ? `
       <div class="example-box">
         <div class="example-label">
-          <span>例句 · 点单词可查</span>
-          <button class="small-audio" type="button" data-speak="${escAttr(entry.e)}">${ICONS.speaker} 朗读</button>
+          <span>${exampleLabel} · 点单词可查</span>
+          <button class="small-audio" type="button" data-speak="${escAttr(exampleSpeak)}">${ICONS.speaker} 朗读</button>
         </div>
-        <div class="example-en">${renderTappable(entry.e)}</div>
-        <div class="example-zh">${esc(entry.t)}</div>
+        <div class="example-en">${entry.paper ? renderPaperExample(entry.e) : renderTappable(entry.e)}</div>
+        ${entry.t ? `<div class="example-zh">${esc(entry.t)}</div>` : ""}
+        ${entry.cn ? `<div class="example-zh">原句按原卷保留空格；这个词是第 ${entry.cn} 题的一个选项。</div>` : ""}
       </div>` : `
       <div class="example-box">
         <div class="example-label"><span>例句</span></div>
@@ -3097,8 +5200,9 @@
         <div class="feedback-head">
           <span class="feedback-icon">${isCorrect ? "✓" : "×"}</span>
           <span>${isCorrect ? (isNew ? "新词答对了" : "答对了") : revealed ? "看过答案，再记一遍" : "答错了，看看正确答案"}</span>
-          <span class="feedback-score">${points > 0 ? `+${points}` : revealed ? "已记入错词" : "下次记住"}</span>
+          <span class="feedback-score">${points > 0 ? `+${points}` : "已记入错词"}</span>
         </div>
+        <div class="feedback-personal">${personalButtonHTML(entry.w)}</div>
         <div class="feedback-word-row">
           <button class="feedback-word tapword" type="button" data-word="${escAttr(entry.w)}">${esc(entry.w)}</button>
           ${entry.p ? `<span class="phonetic">/${esc(entry.p)}/</span>` : ""}
@@ -3277,6 +5381,7 @@
         $("#splashText").textContent = "正在读取本地词库…";
       }
       await loadMeta();
+      loadWordIndex().catch((error) => console.warn("Word index will load on demand", error));
       if (!state.meta.books.some((book) => book.id === store.settings.bookId)) {
         store.settings.bookId = state.meta.books[0].id;
         saveStore();
@@ -3416,12 +5521,24 @@
       else switchTab("settings");
     });
 
+    $("#topUpload").addEventListener("click", openUploadPicker);
+
     $$(".tab").forEach((tab) => {
       tab.addEventListener("click", () => switchTab(tab.dataset.tab));
     });
 
     $("#sessionClose").addEventListener("click", () => closeSession());
     $("#backdrop").addEventListener("click", closeSheet);
+
+    $("#view").addEventListener("change", (event) => {
+      const select = event.target.closest("[data-setting-select]");
+      if (!select) return;
+      if (select.dataset.settingSelect === "voice") {
+        store.settings.voiceURI = select.value;
+        saveStore();
+        speak("Hello! This is your English reading voice.", { gesture: true });
+      }
+    });
 
     $("#view").addEventListener("click", (event) => {
       const target = event.target;
@@ -3432,12 +5549,18 @@
       }
       const bookButton = target.closest("[data-book]");
       if (bookButton) {
-        selectBook(bookButton.dataset.book);
+        // 个人词汇卡片点开是「管理」：可以直接删掉不想要的词。
+        if (bookButton.dataset.book === UPLOAD_BOOK_ID) openUploadManageSheet();
+        else selectBook(bookButton.dataset.book);
         return;
       }
       const rangeButton = target.closest("[data-open-range]");
       if (rangeButton) {
         openRangeSheet();
+        return;
+      }
+      if (target.closest("[data-delete-upload]")) {
+        clearUpload();
         return;
       }
       const modeButton = target.closest("[data-mode]");
@@ -3474,7 +5597,11 @@
         const value = settingButton.dataset.value;
         if (key === "dailyNew") store.settings.dailyNew = clamp(parseInt(value, 10) || 20, 5, 100);
         else if (key === "dailyReview") store.settings.dailyReview = clamp(parseInt(value, 10) || 20, 0, 100);
-        else if (key === "accent") store.settings.accent = value === "uk" ? "uk" : "us";
+        else if (key === "accent") {
+          store.settings.accent = value === "uk" ? "uk" : "us";
+          // 换口音时回到系统推荐，避免继续使用另一种口音的语音。
+          store.settings.voiceURI = "";
+        }
         else if (key === "order") store.settings.order = value === "sequence" ? "sequence" : "random";
         else if (key === "soundVolume") {
           const volume = Number(value);
@@ -3509,12 +5636,21 @@
           store.settings.installHintDismissed = true;
           saveStore();
           renderHome();
-        } else if (action === "export") exportData();
+        } else if (action === "data-transfer") openDataTransferSheet();
+        else if (action === "export") exportData();
         else if (action === "import") importData();
         else if (action === "reset") resetData();
         else if (action === "sound-preview") previewFeedbackSound();
+        else if (action === "voice-preview") speak("Hello! This is your English reading voice.", { gesture: true });
+        else if (action === "refresh-voices") {
+          loadVoices();
+          renderSettings();
+          toast(voices.length ? `已找到 ${voices.length} 个语音` : "还没有加载到语音，请稍后再试", !voices.length);
+        }
         else if (action === "cache-offline") requestOfflineCache(true);
         else if (action === "update") checkUpdate();
+        else if (action === "upload-file") openUploadPicker();
+        else if (action === "manage-upload") openUploadManageSheet();
         return;
       }
     });
@@ -3523,6 +5659,11 @@
       const target = event.target;
       if (target.closest("[data-submit]")) {
         submitSpelling();
+        return;
+      }
+      if (target.closest("[data-personal-toggle]")) {
+        const item = ui.session && ui.session.queue[ui.session.index];
+        togglePersonalWord(item ? item.word : null, target.closest("[data-personal-toggle]"));
         return;
       }
       if (target.closest("[data-next]")) {
@@ -3570,6 +5711,8 @@
       if (event.key !== "Enter") return;
       const session = ui.session;
       if (!session) return;
+      // 焦点在个人词汇按钮上时，Enter 交给按钮自己处理，不要跳到下一题。
+      if (event.target && event.target.closest && event.target.closest("[data-personal-toggle]")) return;
       if (session.answered) {
         event.preventDefault();
         event.stopPropagation();
@@ -3587,8 +5730,49 @@
 
     $("#sheetContent").addEventListener("click", (event) => {
       const target = event.target;
+      if (target.closest("[data-data-export]")) {
+        exportData(selectedScopes());
+        return;
+      }
+      if (target.closest("[data-data-import]")) {
+        const chosen = selectedScopes();
+        if (!chosen.length) {
+          toast("先选择要导入的数据范围", true);
+          return;
+        }
+        importData(chosen);
+        return;
+      }
       if (target.closest("[data-close-sheet]")) {
         closeSheet();
+        return;
+      }
+      if (target.closest("[data-pick-upload]")) {
+        openUploadPicker();
+        return;
+      }
+      if (target.closest("[data-upload-all]")) {
+        setUploadSelection(true);
+        return;
+      }
+      if (target.closest("[data-upload-none]")) {
+        setUploadSelection(false);
+        return;
+      }
+      if (target.closest("[data-upload-confirm]")) {
+        confirmUploadSelection();
+        return;
+      }
+      if (target.closest("[data-upload-delete]")) {
+        deleteSelectedUploadWords();
+        return;
+      }
+      if (target.closest("[data-upload-practice]")) {
+        activateUploadBook();
+        return;
+      }
+      if (target.closest("[data-upload-clear]")) {
+        clearUpload();
         return;
       }
       const bookButton = target.closest("[data-book-select]");
@@ -3643,6 +5827,32 @@
         closeSheet();
         handleAnswer(false, "手写", null);
       }
+    });
+
+    $("#sheetContent").addEventListener("change", (event) => {
+      const scope = event.target.closest("[data-scope]");
+      if (scope) {
+        if (scope.dataset.scope === "all") {
+          for (const box of scopeCheckboxes()) box.checked = scope.checked;
+        }
+        updateDataTransferUI();
+        return;
+      }
+      const checkbox = event.target.closest("[data-upload-select]");
+      if (!checkbox || !ui.uploadDraft) return;
+      if (checkbox.checked) ui.uploadDraft.selected.add(checkbox.value);
+      else ui.uploadDraft.selected.delete(checkbox.value);
+      updateUploadPickCount();
+    });
+
+    $("#sheetContent").addEventListener("click", handleUploadPickClick, true);
+    $("#sheetContent").addEventListener("pointerdown", beginUploadDrag);
+    document.addEventListener("pointermove", moveUploadDrag, { passive: false });
+    document.addEventListener("pointerup", endUploadDrag);
+    document.addEventListener("pointercancel", endUploadDrag);
+    $("#sheetContent").addEventListener("touchmove", moveUploadTouch, { passive: false });
+    $("#sheetContent").addEventListener("contextmenu", (event) => {
+      if (ui.uploadDrag && ui.uploadDrag.active) event.preventDefault();
     });
 
     document.addEventListener("click", (event) => {

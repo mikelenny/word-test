@@ -393,6 +393,10 @@ def main() -> None:
 
     books_meta = []
     dictionary: dict[str, list[str]] = {}
+    # 合并索引：一个词属于哪些词库，用位掩码表示。
+    # 1=高考，2=四级，4=雅思，8=考研。前端用它判断“最基础归属”。
+    level_bits = {"gaokao": 1, "cet4": 2, "ielts": 4, "kaoyan": 8}
+    word_index: dict[str, int] = {}
 
     for spec in book_specs:
         # Keep source order, drop duplicates and empty definitions.
@@ -422,12 +426,17 @@ def main() -> None:
             "color": spec["color"],
             "count": len(words),
         })
+        bit = level_bits.get(spec["id"], 0)
         for entry in words:
             dictionary.setdefault(entry["w"], [entry.get("p", ""), entry["m"]])
+            if bit:
+                key = entry["w"].lower()
+                word_index[key] = word_index.get(key, 0) | bit
 
     for word, (phonetic, meaning) in FUNCTION_WORDS.items():
         dictionary.setdefault(word, [phonetic, meaning])
 
+    write_json(out / "word-index.json", word_index)
     write_json(out / "dict.json", dictionary)
     write_json(out / "meta.json", {
         "version": date.today().strftime("%Y%m%d"),

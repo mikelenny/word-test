@@ -1,5 +1,5 @@
 /* 词听 offline cache */
-const CACHE = "citing-v1.3.3";
+const CACHE = "citing-v1.5.6";
 const CORE = [
   "./",
   "./index.html",
@@ -14,11 +14,14 @@ const CORE = [
 ];
 const DATA = [
   "./data/meta.json",
+  "./data/word-index.json",
   "./data/dict.json",
   "./data/books/gaokao.json",
   "./data/books/ielts.json",
   "./data/books/cet4.json",
   "./data/books/kaoyan.json",
+  "./vendor/pdf/pdf.min.mjs",
+  "./vendor/pdf/pdf.worker.min.mjs",
 ];
 
 let dataPromise = null;
@@ -65,7 +68,7 @@ async function cacheData() {
   for (const url of DATA) {
     const cached = await cache.match(url);
     if (!cached) {
-      const response = await fetchWithTimeout(url, 20000);
+      const response = await fetchWithTimeout(url, 30000);
       if (!response.ok) throw new Error(`${response.status} ${url}`);
       await cache.put(url, response);
     }
