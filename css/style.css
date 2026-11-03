@@ -1113,6 +1113,11 @@ svg {
 .word-option-action svg {
   width: 14px;
   height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .word-option-go {
@@ -1124,6 +1129,11 @@ svg {
 .word-option-go svg {
   width: 16px;
   height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* 下拉候选定位到列表时的短暂高亮 */
@@ -1171,6 +1181,11 @@ svg {
 .book-card-action svg {
   width: 16px;
   height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .book-card-action:active {
