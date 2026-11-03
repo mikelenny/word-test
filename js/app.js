@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.5.6";
+  const APP_VERSION = "1.5.8";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -58,6 +58,7 @@
     eye: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.8 12s3.3-6 9.2-6 9.2 6 9.2 6-3.3 6-9.2 6-9.2-6-9.2-6Z"/><circle cx="12" cy="12" r="2.6"/></svg>`,
     plus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>`,
     minus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg>`,
+    search: `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.4"/><path d="m15.2 15.2 4.3 4.3"/></svg>`,
   };
 
   const MODE_LABEL = {
@@ -144,6 +145,10 @@
     uploadDraft: null,
     uploadDrag: null,
     uploadSuppressClick: 0,
+    wordSearchToken: 0,
+    dictEntries: null,
+    dictEntriesFor: null,
+    browseBookId: "",
   };
 
   let store = loadStore();
@@ -1507,15 +1512,22 @@
     const bookCards = state.meta.books.map((meta) => {
       const bStats = progressStats(meta);
       const active = meta.id === book.id;
+      const isUpload = meta.id === UPLOAD_BOOK_ID;
+      const action = isUpload
+        ? `<button class="book-card-action" type="button" data-book-manage aria-label="管理个人词汇">${ICONS.pencil}</button>`
+        : `<button class="book-card-action" type="button" data-book-browse="${escAttr(meta.id)}" aria-label="搜索并浏览${escAttr(meta.name)}">${ICONS.search}</button>`;
       return `
-        <button class="book-card ${active ? "is-active" : ""}" type="button" data-book="${escAttr(meta.id)}" style="color:${escAttr(meta.color)}">
-          <span class="book-card-top">
-            <i class="book-dot" style="background:${escAttr(meta.color)}"></i>
-            <strong style="color:var(--ink)">${esc(meta.name)}</strong>
-          </span>
-          <small>${bStats.total} 词 · 已学 ${bStats.pct}%</small>
-          <span class="mini-progress"><i style="width:${bStats.pct}%;background:${escAttr(meta.color)}"></i></span>
-        </button>`;
+        <div class="book-card-wrap">
+          <button class="book-card ${active ? "is-active" : ""}" type="button" data-book="${escAttr(meta.id)}" style="color:${escAttr(meta.color)}">
+            <span class="book-card-top">
+              <i class="book-dot" style="background:${escAttr(meta.color)}"></i>
+              <strong style="color:var(--ink)">${esc(meta.name)}</strong>
+            </span>
+            <small>${bStats.total} 词 · 已学 ${bStats.pct}%</small>
+            <span class="mini-progress"><i style="width:${bStats.pct}%;background:${escAttr(meta.color)}"></i></span>
+          </button>
+          ${action}
+        </div>`;
     }).join("");
 
     const heroSub = targetDone
@@ -1594,6 +1606,13 @@
           <button class="soft-btn" type="button" data-go-wrong>去复习</button>
         </div>` : ""}
 
+      <div class="manual-add">
+        <div class="section-head">
+          <h2>手动加词</h2>
+        </div>
+        ${wordSearchHTML({ mode: "manual", placeholder: "输入英文词，拼错也会给出相近词", button: "手动检录" })}
+      </div>
+
       <div class="section-head">
         <h2>今日例句</h2>
         <button class="text-btn" type="button" data-new-sentence>换一句</button>
@@ -1616,6 +1635,167 @@
 
       <p class="tip-line">完全离线 · 无广告 · 无账号<br>学习记录只保存在这台设备上</p>
     `;
+  }
+
+  /* ---------------- 词汇搜索下拉（手动检录 / 词库浏览 / 个人词汇管理） ---------------- */
+  // 三处共用同一个「输入 → 下拉候选」组件。候选排序：精确 > 前缀 > 包含 > 编辑距离 1–2。
+  // 即便拼写完全正确，也会作为第一项显示英文 + 中文对照，不直接加词。
+  function wordSearchHTML(options) {
+    const { mode, bookId = "", placeholder, button } = options;
+    return `
+      <div class="word-search" data-word-search="${escAttr(mode)}" data-book-id="${escAttr(bookId)}">
+        <form class="word-search-form" data-word-search-form>
+          <input class="word-search-input" type="text" data-word-search-input
+            autocapitalize="none" autocomplete="off" spellcheck="false"
+            placeholder="${escAttr(placeholder)}" aria-label="${escAttr(placeholder)}">
+          <button class="soft-btn word-search-go" type="submit" data-word-search-go>${esc(button)}</button>
+        </form>
+        <div class="word-search-menu" data-word-search-menu hidden></div>
+      </div>`;
+  }
+
+  function dictEntries() {
+    const dict = state.dict || {};
+    if (ui.dictEntries && ui.dictEntriesFor === dict) return ui.dictEntries;
+    ui.dictEntries = Object.keys(dict).map((w) => ({ w, p: dict[w][0] || "", m: dict[w][1] || "" }));
+    ui.dictEntriesFor = dict;
+    return ui.dictEntries;
+  }
+
+  function searchWordCandidates(raw, entries, limit = 10) {
+    const q = String(raw || "").toLowerCase().replace(/[^a-z]/g, "");
+    if (!q) return [];
+    const seen = new Set();
+    const out = [];
+    const push = (entry, score) => {
+      const w = String((entry && entry.w) || "").toLowerCase();
+      if (!w || seen.has(w)) return;
+      seen.add(w);
+      out.push({ w, p: entry.p || "", m: entry.m || "", score });
+    };
+    const list = Array.isArray(entries) ? entries : [];
+    for (const entry of list) {
+      if (String(entry.w || "").toLowerCase() === q) push(entry, 0);
+    }
+    for (const entry of list) {
+      const w = String(entry.w || "").toLowerCase();
+      if (w !== q && w.startsWith(q)) push(entry, 1 + (w.length - q.length) * 0.001);
+    }
+    for (const entry of list) {
+      const w = String(entry.w || "").toLowerCase();
+      if (!w.startsWith(q) && w.includes(q)) push(entry, 2 + (w.length - q.length) * 0.001);
+    }
+    if (out.length < limit) {
+      const near = [];
+      for (const entry of list) {
+        const w = String(entry.w || "").toLowerCase();
+        if (seen.has(w) || Math.abs(w.length - q.length) > 2) continue;
+        const d = editDistanceAtMost(q, w, 2);
+        if (d > 0 && d <= 2) near.push({ entry, d, w });
+      }
+      near.sort((a, b) => a.d - b.d || a.w.localeCompare(b.w));
+      for (const item of near) {
+        if (out.length >= limit) break;
+        push(item.entry, 3 + item.d);
+      }
+    }
+    out.sort((a, b) => a.score - b.score || a.w.localeCompare(b.w));
+    return out.slice(0, limit);
+  }
+
+  function renderWordOptions(candidates, mode) {
+    const hint = mode === "manual"
+      ? "点右侧按钮，加入或移出个人词汇"
+      : "点词汇定位到下方列表";
+    const head = `<p class="word-search-hint">找到 ${candidates.length} 个相近词 · ${hint}</p>`;
+    const items = candidates.map(({ w, p, m }) => {
+      const meaning = shortMeaning(m) || "暂无释义";
+      if (mode === "manual") {
+        const added = inPersonalWords(w);
+        return `<div class="word-option">
+          <span class="word-option-copy"><strong>${esc(w)}</strong><small>${esc(meaning)}</small></span>
+          <button class="word-option-action${added ? " is-added" : ""}" type="button"
+            data-manual-toggle="${escAttr(w)}" data-ph="${escAttr(p)}" data-m="${escAttr(m)}">
+            ${added ? `${ICONS.minus} 移出` : `${ICONS.plus} 加入`}
+          </button>
+        </div>`;
+      }
+      return `<button class="word-option is-jump" type="button" data-word-jump="${escAttr(w)}">
+        <span class="word-option-copy"><strong>${esc(w)}</strong><small>${esc(meaning)}</small></span>
+        <span class="word-option-go">${ICONS.arrow}</span>
+      </button>`;
+    }).join("");
+    return `${head}<div class="word-search-list">${items}</div>`;
+  }
+
+  async function runWordSearch(root) {
+    if (!root) return;
+    const input = $("[data-word-search-input]", root);
+    const menu = $("[data-word-search-menu]", root);
+    if (!input || !menu) return;
+    const token = ++ui.wordSearchToken;
+    const mode = root.dataset.wordSearch;
+    const raw = input.value.trim().toLowerCase().replace(/[^a-z]/g, "");
+    if (!raw) {
+      menu.hidden = true;
+      menu.innerHTML = "";
+      return;
+    }
+    let entries = [];
+    if (mode === "manual") {
+      // 离线词典还在缓存时先提示，等缓存完成后继续本次搜索。
+      if (!state.dict) {
+        menu.innerHTML = `<div class="word-search-empty">正在缓存词典，请稍后…</div>`;
+        menu.hidden = false;
+        try {
+          await loadDict();
+        } catch (error) {
+          if (token === ui.wordSearchToken) menu.innerHTML = `<div class="word-search-empty">词典加载失败，请稍后重试。</div>`;
+          return;
+        }
+        if (token !== ui.wordSearchToken) return;
+      }
+      entries = dictEntries();
+    } else if (mode === "browse") {
+      const book = state.books[root.dataset.bookId];
+      entries = book ? book.words : [];
+    } else if (mode === "manage") {
+      entries = (state.upload && state.upload.words) || [];
+    }
+    if (token !== ui.wordSearchToken) return;
+    const candidates = searchWordCandidates(raw, entries, 10);
+    menu.innerHTML = candidates.length
+      ? renderWordOptions(candidates, mode)
+      : `<div class="word-search-empty">没有找到相近的词汇，换个拼写试试？</div>`;
+    menu.hidden = false;
+  }
+
+  function hideWordSearchMenus() {
+    $$("[data-word-search-menu]").forEach((menu) => { menu.hidden = true; });
+  }
+
+  function handleManualToggle(word, button) {
+    if (!word || !button) return;
+    const entry = { w: word, p: button.dataset.ph || "", m: button.dataset.m || "暂无释义" };
+    if (inPersonalWords(word)) removeWordFromPersonal(word, null, true);
+    else addWordToPersonal(entry, null, true);
+    const added = inPersonalWords(word);
+    button.classList.toggle("is-added", added);
+    button.innerHTML = added ? `${ICONS.minus} 移出` : `${ICONS.plus} 加入`;
+  }
+
+  function jumpToWordRow(word) {
+    const root = $("#sheetContent");
+    if (!root) return;
+    const rows = $$("[data-word-row]", root);
+    const row = rows.find((item) => item.dataset.wordRow === word);
+    if (row) {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      row.classList.add("is-flash");
+      window.setTimeout(() => row.classList.remove("is-flash"), 1400);
+    }
+    const menu = $("[data-word-search-menu]", root);
+    if (menu) menu.hidden = true;
   }
 
   /* ---------------- wrong words ---------------- */
@@ -3307,7 +3487,7 @@
     button.innerHTML = added ? `${ICONS.minus} 从个人词汇中移出` : `${ICONS.plus} 加入个人词汇`;
   }
 
-  function addWordToPersonal(entry, button) {
+  function addWordToPersonal(entry, button, skipRender = false) {
     const item = personalEntryFrom(entry);
     if (!item) return;
     if (inPersonalWords(item.w)) {
@@ -3324,8 +3504,10 @@
       // 新词要能进练习范围：范围和词表重排序对不上，直接放开成全部。
       delete store.settings.ranges[UPLOAD_BOOK_ID];
       saveStore();
-      if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
-      else if (!ui.session) renderCurrent();
+      if (!skipRender) {
+        if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
+        else if (!ui.session) renderCurrent();
+      }
       setPersonalButtonState(button, true);
       toast(`「${item.w}」已加入个人词汇 · 共 ${uploadStats().total} 词`);
     } catch (error) {
@@ -3334,7 +3516,7 @@
     }
   }
 
-  function removeWordFromPersonal(word, button) {
+  function removeWordFromPersonal(word, button, skipRender = false) {
     const key = String(word || "").toLowerCase();
     const upload = state.upload;
     if (!key || !upload || !Array.isArray(upload.words)) return;
@@ -3364,7 +3546,7 @@
       saveStore();
       syncUploadBookMeta();
       setPersonalButtonState(button, false);
-      ensureCurrentBook().catch(() => {});
+      if (!skipRender) ensureCurrentBook().catch(() => {});
       toast(`「${key}」已移出，个人词汇已清空`);
       return;
     }
@@ -3380,8 +3562,10 @@
     invalidateUploadBook();
     syncUploadBookMeta();
     saveStore();
-    if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
-    else if (!ui.session) renderCurrent();
+    if (!skipRender) {
+      if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
+      else if (!ui.session) renderCurrent();
+    }
     setPersonalButtonState(button, false);
     toast(`「${key}」已从个人词汇移出 · 还剩 ${remaining.length} 词`);
   }
@@ -3500,7 +3684,7 @@
   function uploadManageItemHTML(entry, checked) {
     const library = affiliationFor(entry.w, entry);
     return `
-      <label class="upload-pick-item">
+      <label class="upload-pick-item" data-word-row="${escAttr(entry.w)}">
         <input type="checkbox" data-upload-select value="${escAttr(entry.w)}" ${checked ? "checked" : ""}>
         <span class="upload-pick-copy">
           <span class="upload-pick-word">
@@ -3796,7 +3980,7 @@
   function uploadWordHTML(entry) {
     const library = affiliationFor(entry.w, entry);
     return `
-      <button class="upload-word" type="button" data-word="${escAttr(entry.w)}">
+      <button class="upload-word" type="button" data-word="${escAttr(entry.w)}" data-word-row="${escAttr(entry.w)}">
         <span class="upload-word-main">
           <strong>${esc(entry.w)}</strong>
           <small>${esc(shortMeaning(entry.m))}</small>
@@ -3860,6 +4044,31 @@
     `);
   }
 
+  // 学习范围里点词库右上角的放大镜：只读浏览该词库全部词汇，顶部可搜索定位。
+  async function openBookBrowseSheet(bookId) {
+    const meta = state.meta.books.find((item) => item.id === bookId);
+    if (!meta) return;
+    let book = state.books[bookId];
+    if (!book) {
+      toast("正在加载词库…");
+      try {
+        book = await ensureBook(bookId);
+      } catch (error) {
+        toast("词库加载失败，请稍候再试", true);
+        return;
+      }
+    }
+    ui.browseBookId = bookId;
+    openSheet(`
+      ${sheetHead(meta.name, `共 ${book.words.length} 词 · 点单词可查释义`)}
+      ${wordSearchHTML({ mode: "browse", bookId, placeholder: "输入英文词，下拉显示相近词汇", button: "搜索" })}
+      <div class="sheet-note">只读词库列表，没有增删功能；顶部搜索框可快速定位到某个词。</div>
+      <div class="upload-pick-scroll" data-browse-scroll>
+        ${uploadSectionsHTML({ words: book.words })}
+      </div>
+    `, { maximized: true, focus: false });
+  }
+
   function openUploadManageSheet() {
     if (!state.upload || !state.upload.words.length) {
       openSheet(`
@@ -3881,6 +4090,7 @@
     ui.uploadDraft = { mode: "delete", entries: words, selected: new Set(), anchorIndex: null };
     openSheet(`
       ${sheetHead("个人词汇", subtitle)}
+      ${wordSearchHTML({ mode: "manage", placeholder: "输入英文词，下拉显示已收录词汇", button: "搜索" })}
       ${uploadSummaryHTML(stats)}
       <div class="upload-actions">
         <button class="primary-btn" type="button" data-upload-practice>开始练习</button>
@@ -3955,11 +4165,13 @@
     const query = String(raw || "").toLowerCase().replace(/^[^a-z]+|[^a-z]+$/g, "");
     if (!query) return;
     const token = ++ui.lookupToken;
+    // 离线词典还在缓存中（已发起加载但还没完成）时，查词暂时用不了，明确提示用户。
+    const caching = Boolean(!state.dict && state.dictPromise);
     openSheet(`
-      ${sheetHead("查词", "正在查找离线词库…")}
+      ${sheetHead("查词", caching ? "正在缓存词典，请稍后…" : "正在查找离线词库…")}
       <div class="empty-state" style="padding:24px 10px 30px">
         <div class="empty-icon">${ICONS.book}</div>
-        <p>正在查找 ${esc(query)}…</p>
+        <p>${caching ? "离线词典正在缓存中，请稍候再查词。" : `正在查找 ${esc(query)}…`}</p>
       </div>
     `);
 
@@ -4008,6 +4220,12 @@
     const alreadyWrong = Boolean(progress && (progress.wrongCount || 0) > 0 && !progress.mastered);
     const example = found && found.entry.e ? found.entry : null;
 
+    ui.currentLookup = {
+      base: result.base,
+      phonetic: result.phonetic || "",
+      meaning: result.meaning || "",
+      entry: found ? found.entry : null,
+    };
     openSheet(`
       ${sheetHead("查词", exact ? "音标 · 释义 · 例句" : `原形：${result.base}`)}
       <div class="lookup-word">${esc(query)}</div>
@@ -4026,7 +4244,8 @@
           <div class="example-en">${example.paper ? renderPaperExample(example.e) : renderTappable(example.e)}</div>
           ${example.t ? `<div class="example-zh">${esc(example.t)}</div>` : ""}
         </div>` : ""}
-      <div class="lookup-actions">
+      <div class="lookup-actions lookup-actions-stack">
+        <button class="ghost-btn personal-toggle ${inPersonalWords(result.base) ? " is-added" : ""}" type="button" data-personal-word="${escAttr(result.base)}">${inPersonalWords(result.base) ? `${ICONS.minus} 从个人词汇中移出` : `${ICONS.plus} 加入个人词汇`}</button>
         ${inCurrentBook
           ? `<button class="primary-btn" type="button" data-mark-word="${escAttr(found.entry.w)}" ${alreadyWrong ? "disabled" : ""}>${alreadyWrong ? "已在错词本" : "加入错词本"}</button>`
           : `<button class="primary-btn" type="button" data-close-sheet>知道了</button>`}
@@ -4709,7 +4928,7 @@
     const letterCount = entry.w.replace(/[^a-z]/gi, "").length;
     openSheet(`
       ${sheetHead("手写识别", "用印刷体在格子里写，每格一个字母；大写更准")}
-      <div class="hw-hint">中文提示：<strong>${esc(shortMeaning(entry.m))}</strong> · 共 ${letterCount} 个字母</div>
+      <div class="hw-hint">中文提示：<strong>${esc(shortMeaning(entry.m))}</strong></div>
       <div class="hw-grid-wrap" id="hwGridWrap">
         <canvas class="hw-grid" id="hwGrid" aria-hidden="true"></canvas>
         <canvas class="hw-ink" id="hwCanvas" aria-label="手写区域"></canvas>
@@ -4925,7 +5144,7 @@
               <button class="audio-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker} 听发音</button>
               <button class="ghost-chip" type="button" data-handwriting>${ICONS.pencil} 手写板</button>
             </div>
-            <div class="word-slots" aria-label="共 ${entry.w.replace(/[^a-z]/gi, "").length} 个字母">${slotsHTML(entry.w)}</div>
+            <div class="word-slots" id="wordSlots" aria-label="请写出这个单词"><span class="slots-line"></span></div>
             <input class="answer-input ${useSoftKeyboard() ? "is-soft" : ""}" id="answerInput" type="text"
               inputmode="${useSoftKeyboard() && isTouchDevice() ? "none" : "text"}"
               ${useSoftKeyboard() && isTouchDevice() ? "readonly" : ""}
@@ -5060,6 +5279,9 @@
       const pattern = Array.from(entry.w).map((char, index) => (index === 0 ? char : /[a-z]/i.test(char) ? "·" : char)).join(" ");
       hint.textContent = `提示：${pattern} · 共 ${entry.w.replace(/[^a-z]/gi, "").length} 个字母`;
     }
+    // 字母数 / 字母格默认不显示，点“提示”后才出现。
+    const slots = $("#wordSlots");
+    if (slots) slots.innerHTML = slotsHTML(entry.w);
   }
 
   function revealAnswer() {
@@ -5540,6 +5762,27 @@
       }
     });
 
+    const runWordSearchForm = (event) => {
+      const form = event.target.closest("[data-word-search-form]");
+      if (!form) return;
+      event.preventDefault();
+      const root = form.closest("[data-word-search]");
+      if (root) runWordSearch(root);
+    };
+    $("#view").addEventListener("submit", runWordSearchForm);
+    $("#sheetContent").addEventListener("submit", runWordSearchForm);
+
+    const onWordSearchInput = (event) => {
+      const input = event.target.closest("[data-word-search-input]");
+      if (!input) return;
+      const root = input.closest("[data-word-search]");
+      if (!root) return;
+      clearTimeout(input._wdSearchTimer);
+      input._wdSearchTimer = window.setTimeout(() => runWordSearch(root), 140);
+    };
+    $("#view").addEventListener("input", onWordSearchInput);
+    $("#sheetContent").addEventListener("input", onWordSearchInput);
+
     $("#view").addEventListener("click", (event) => {
       const target = event.target;
       if (target.closest("[data-retry-book]")) {
@@ -5547,11 +5790,19 @@
         ensureCurrentBook().catch(() => {});
         return;
       }
+      const browseButton = target.closest("[data-book-browse]");
+      if (browseButton) {
+        openBookBrowseSheet(browseButton.dataset.bookBrowse);
+        return;
+      }
+      if (target.closest("[data-book-manage]")) {
+        openUploadManageSheet();
+        return;
+      }
       const bookButton = target.closest("[data-book]");
       if (bookButton) {
-        // 个人词汇卡片点开是「管理」：可以直接删掉不想要的词。
-        if (bookButton.dataset.book === UPLOAD_BOOK_ID) openUploadManageSheet();
-        else selectBook(bookButton.dataset.book);
+        // 卡片主体（非右上角功能键）一律直接切换词库，个人词汇也一样。
+        selectBook(bookButton.dataset.book);
         return;
       }
       const rangeButton = target.closest("[data-open-range]");
@@ -5579,6 +5830,11 @@
       if (target.closest("[data-new-sentence]")) {
         ui.sentenceSeed += 1;
         renderHome();
+        return;
+      }
+      const manualToggle = target.closest("[data-manual-toggle]");
+      if (manualToggle) {
+        handleManualToggle(manualToggle.dataset.manualToggle, manualToggle);
         return;
       }
       const wrongMode = target.closest("[data-wrong-mode]");
@@ -5730,6 +5986,11 @@
 
     $("#sheetContent").addEventListener("click", (event) => {
       const target = event.target;
+      const jumpButton = target.closest("[data-word-jump]");
+      if (jumpButton) {
+        jumpToWordRow(jumpButton.dataset.wordJump);
+        return;
+      }
       if (target.closest("[data-data-export]")) {
         exportData(selectedScopes());
         return;
@@ -5790,6 +6051,14 @@
         markWord(markButton.dataset.markWord);
         return;
       }
+      const personalLookupBtn = target.closest("[data-personal-word]");
+      if (personalLookupBtn) {
+        const word = personalLookupBtn.dataset.personalWord;
+        const lookup = ui.currentLookup || {};
+        const entry = lookup.entry || { w: word, p: lookup.phonetic || "", m: lookup.meaning || "" };
+        togglePersonalWord(entry, personalLookupBtn);
+        return;
+      }
       if (target.closest("[data-hw-clear]")) {
         clearHandwriting();
         return;
@@ -5814,7 +6083,7 @@
         if (reveal) reveal.hidden = true;
         if (hwState) {
           const status = $("#hwStatus");
-          if (status) status.textContent = `答案：${hwState.entry.w}。请对照后选择。`;
+          if (status) status.textContent = `答案：${hwState.entry.w}（共 ${hwState.entry.w.replace(/[^a-z]/gi, "").length} 个字母）。请对照后选择。`;
         }
         return;
       }
@@ -5853,6 +6122,11 @@
     $("#sheetContent").addEventListener("touchmove", moveUploadTouch, { passive: false });
     $("#sheetContent").addEventListener("contextmenu", (event) => {
       if (ui.uploadDrag && ui.uploadDrag.active) event.preventDefault();
+    });
+
+    // 点搜索框/下拉以外的地方，收起所有词汇搜索下拉。
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("[data-word-search]")) hideWordSearchMenus();
     });
 
     document.addEventListener("click", (event) => {
