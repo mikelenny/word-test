@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.5.9";
+  const APP_VERSION = "1.8.0";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -18,6 +18,8 @@
   ];
   const LIBRARY_BY_ID = Object.fromEntries(LIBRARY_LEVELS.map((item) => [item.id, item]));
   const UPLOAD_MAX_WORDS = 3000;
+  const PERSONAL_COLORS = ["#8a6a3b", "#5f7a5a", "#7a6a9c", "#a4694c", "#4f7288", "#8a5f75"];
+  const PERSONAL_NAME_MAX = 16;
 
   // 试卷里大量出现冠词、介词和代词；这些不是要背的“词汇”。
   const UPLOAD_STOPWORDS = new Set(`
@@ -120,7 +122,7 @@
     bookPromises: {},
     wordIndex: null,
     wordIndexPromise: null,
-    upload: loadUpload(),
+    personal: loadPersonal(),
     pdfjsPromise: null,
   };
 
@@ -149,6 +151,11 @@
     dictEntries: null,
     dictEntriesFor: null,
     browseBookId: "",
+    manageBookId: "",
+    uploadTargetId: "",
+    manualTargetId: "",
+    wrongSelected: new Set(),
+    wrongScope: "",
   };
 
   let store = loadStore();
@@ -389,20 +396,6 @@
     return selectRelatedGroups(entries, entries.length, book).reduce((out, group) => out.concat(group), []);
   }
 
-  function weaveGroups(freshGroups, dueGroups) {
-    const queue = [];
-    const max = Math.max(freshGroups.length, dueGroups.length);
-    for (let i = 0; i < max; i += 1) {
-      if (freshGroups[i]) {
-        for (const entry of freshGroups[i]) queue.push({ word: entry, isNew: true });
-      }
-      if (dueGroups[i]) {
-        for (const entry of dueGroups[i]) queue.push({ word: entry, isNew: false });
-      }
-    }
-    return queue;
-  }
-
   function normalizeAnswer(value) {
     return String(value || "")
       .toLowerCase()
@@ -486,6 +479,7 @@
       if (typeof settings.softKeyboard !== "boolean") settings.softKeyboard = isTouchDevice();
       settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
       settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
+      settings.personalTargetId = typeof settings.personalTargetId === "string" ? settings.personalTargetId : "";
       return {
         version: 1,
         settings,
@@ -516,6 +510,7 @@
         softKeyboard: isTouchDevice(),
         soundVolume: 1.5,
         ranges: {},
+        personalTargetId: "",
         installHintDismissed: false,
       },
       progress: {},
@@ -535,45 +530,194 @@
     }
   }
 
-  /* ---------------- uploaded vocabulary ---------------- */
-  function loadUpload() {
+  /* ---------------- 个人词汇本（可以建多本、自己命名） ---------------- */
+  function normalizePersonalWords(list) {
+    return (Array.isArray(list) ? list : [])
+      .filter((entry) => entry && typeof entry.w === "string" && entry.w)
+      .map((entry) => ({
+        ...entry,
+        w: entry.w.toLowerCase(),
+        m: entry.m || "暂无释义",
+        p: entry.p || "",
+        beyond: Boolean(entry.beyond),
+        freq: Number(entry.freq) || 1,
+      }));
+  }
+
+  function newPersonalBookId() {
+    return `pb${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  // 个人词汇存在同一个 localStorage 键里：老版本是一本（直接带 words），
+  // 新版本是多本（books 数组），读进来时统一成多本结构。
+  function loadPersonal() {
+    const empty = { version: 2, books: [], lastUsedId: "" };
     try {
       const raw = JSON.parse(localStorage.getItem(UPLOAD_KEY) || "null");
-      if (!raw || typeof raw !== "object" || !Array.isArray(raw.words)) return null;
-      const words = raw.words
-        .filter((entry) => entry && typeof entry.w === "string" && entry.w)
-        .map((entry) => ({
-          ...entry,
-          w: entry.w.toLowerCase(),
-          m: entry.m || "暂无释义",
-          p: entry.p || "",
-          beyond: Boolean(entry.beyond),
-          freq: Number(entry.freq) || 1,
+      if (!raw || typeof raw !== "object") return empty;
+      if (Array.isArray(raw.words)) {
+        const words = normalizePersonalWords(raw.words);
+        if (!words.length) return empty;
+        const migrated = {
+          version: 2,
+          lastUsedId: UPLOAD_BOOK_ID,
+          books: [{
+            id: UPLOAD_BOOK_ID,
+            name: "个人词汇",
+            createdAt: raw.createdAt || Date.now(),
+            updatedAt: raw.updatedAt || raw.createdAt || Date.now(),
+            files: Array.isArray(raw.files) ? raw.files.slice(0, 20) : [],
+            words,
+          }],
+        };
+        // 迁移一次就落盘，免得每次启动都重算；失败也不影响本次使用。
+        try { localStorage.setItem(UPLOAD_KEY, JSON.stringify(migrated)); } catch (error) { /* ignore */ }
+        return migrated;
+      }
+      const books = (Array.isArray(raw.books) ? raw.books : [])
+        .filter((book) => book && typeof book === "object")
+        .map((book, index) => ({
+          id: typeof book.id === "string" && book.id ? book.id : newPersonalBookId(),
+          name: String(book.name || `词汇本 ${index + 1}`).trim().slice(0, PERSONAL_NAME_MAX) || `词汇本 ${index + 1}`,
+          createdAt: Number(book.createdAt) || Date.now(),
+          updatedAt: Number(book.updatedAt) || Date.now(),
+          files: Array.isArray(book.files) ? book.files.slice(0, 20) : [],
+          words: normalizePersonalWords(book.words),
         }));
-      if (!words.length) return null;
-      return {
-        version: 1,
-        createdAt: raw.createdAt || Date.now(),
-        updatedAt: raw.updatedAt || raw.createdAt || Date.now(),
-        files: Array.isArray(raw.files) ? raw.files.slice(0, 20) : [],
-        words,
-      };
+      const lastUsedId = books.some((book) => book.id === raw.lastUsedId)
+        ? raw.lastUsedId
+        : (books[0] ? books[0].id : "");
+      return { version: 2, lastUsedId, books };
     } catch (error) {
-      console.warn("Failed to load uploaded vocabulary", error);
-      return null;
+      console.warn("Failed to load personal vocabulary", error);
+      return empty;
     }
   }
 
-  function saveUpload(upload) {
+  function savePersonal(personal = state.personal) {
     try {
-      localStorage.setItem(UPLOAD_KEY, JSON.stringify(upload));
+      localStorage.setItem(UPLOAD_KEY, JSON.stringify(personal));
     } catch (error) {
-      console.warn("Failed to save uploaded vocabulary", error);
+      console.warn("Failed to save personal vocabulary", error);
       throw new Error("保存失败：设备存储空间可能已满，请先清理一些数据。");
     }
   }
 
-  function uploadStats(upload = state.upload) {
+  function personalBooks() {
+    return (state.personal && state.personal.books) || [];
+  }
+
+  function personalBook(id) {
+    return personalBooks().find((book) => book.id === id) || null;
+  }
+
+  function personalWordTotal() {
+    return personalBooks().reduce((sum, book) => sum + book.words.length, 0);
+  }
+
+  function activePersonalBook() {
+    return personalBook(state.personal.lastUsedId) || personalBooks()[0] || null;
+  }
+
+  // 「加入/导入到哪一本」的默认目标：优先本次指定，其次上次用过的。
+  function resolvePersonalTarget(preferred = "") {
+    return personalBook(preferred)
+      || personalBook(store.settings.personalTargetId)
+      || personalBook(state.personal.lastUsedId)
+      || personalBooks()[0]
+      || null;
+  }
+
+  function setPersonalTarget(bookId) {
+    if (!personalBook(bookId)) return;
+    state.personal.lastUsedId = bookId;
+    store.settings.personalTargetId = bookId;
+    saveStore();
+  }
+
+  function personalMeta(book, index) {
+    return {
+      id: book.id,
+      name: book.name,
+      short: book.name,
+      subtitle: "自己收进来的词",
+      description: `${book.name} · ${book.words.length} 词`,
+      color: PERSONAL_COLORS[index % PERSONAL_COLORS.length],
+      count: book.words.length,
+      personal: true,
+    };
+  }
+
+  function sanitizePersonalName(name, fallback) {
+    const cleaned = String(name || "").replace(/\s+/g, " ").trim().slice(0, PERSONAL_NAME_MAX);
+    if (!cleaned) return fallback || `词汇本 ${personalBooks().length + 1}`;
+    if (personalBooks().some((book) => book.name === cleaned)) throw new Error("已经有同名词汇本，换个名字吧");
+    return cleaned;
+  }
+
+  function createPersonalBook(name) {
+    const clean = sanitizePersonalName(name);
+    const now = Date.now();
+    const book = {
+      id: newPersonalBookId(),
+      name: clean,
+      createdAt: now,
+      updatedAt: now,
+      files: [],
+      words: [],
+    };
+    state.personal.books.push(book);
+    state.personal.lastUsedId = book.id;
+    savePersonal();
+    syncUploadBookMeta();
+    return book;
+  }
+
+  function renamePersonalBook(bookId, name) {
+    const book = personalBook(bookId);
+    if (!book) throw new Error("词汇本不存在");
+    const clean = String(name || "").replace(/\s+/g, " ").trim().slice(0, PERSONAL_NAME_MAX);
+    if (!clean) throw new Error("名字不能为空");
+    if (personalBooks().some((item) => item.id !== bookId && item.name === clean)) {
+      throw new Error("已经有同名词汇本，换个名字吧");
+    }
+    book.name = clean;
+    book.updatedAt = Date.now();
+    savePersonal();
+    syncUploadBookMeta();
+    return book;
+  }
+
+  function forgetBookData(bookId) {
+    delete store.progress[bookId];
+    delete store.settings.ranges[bookId];
+    for (const day of Object.values(store.daily)) {
+      if (day && day.newByBook) delete day.newByBook[bookId];
+    }
+    if (store.settings.bookId === bookId) store.settings.bookId = "gaokao";
+    if (store.settings.personalTargetId === bookId) store.settings.personalTargetId = "";
+  }
+
+  function deletePersonalBook(bookId) {
+    const book = personalBook(bookId);
+    if (!book) return false;
+    state.personal.books = personalBooks().filter((item) => item.id !== bookId);
+    if (state.personal.lastUsedId === bookId) {
+      state.personal.lastUsedId = personalBooks()[0] ? personalBooks()[0].id : "";
+    }
+    forgetBookData(bookId);
+    invalidateUploadBook(bookId);
+    try {
+      savePersonal();
+    } catch (error) {
+      toast(error && error.message ? error.message : "保存失败", true);
+    }
+    syncUploadBookMeta();
+    saveStore();
+    return true;
+  }
+
+  function uploadStats(upload = activePersonalBook()) {
     let gaokao = 0;
     let beyond = 0;
     const libraries = {};
@@ -597,32 +741,26 @@
       </div>`;
   }
 
-  function uploadMeta(upload) {
-    const stats = uploadStats(upload);
-    const fileName = upload && upload.files && upload.files[0] ? upload.files[0].name : "";
-    return {
-      id: UPLOAD_BOOK_ID,
-      name: "个人词汇",
-      short: "个人",
-      subtitle: "自己收进来的词",
-      description: fileName ? `${fileName} · ${stats.total} 词` : `${stats.total} 词`,
-      color: "#8a6a3b",
-      count: stats.total,
-      uploaded: true,
-    };
-  }
-
-  // 把“个人词汇”放在学习范围最前面，和普通词库共用同一套练习逻辑。
+  // 个人词汇本排在固定词库后面（学习范围第二行），共用同一套练习逻辑。
   function syncUploadBookMeta() {
     if (!state.meta || !Array.isArray(state.meta.books)) return;
-    const books = state.meta.books.filter((book) => book.id !== UPLOAD_BOOK_ID);
-    if (state.upload && state.upload.words.length) books.unshift(uploadMeta(state.upload));
+    const books = state.meta.books.filter((book) => !book.personal);
+    for (const [index, book] of personalBooks().entries()) {
+      books.push(personalMeta(book, index));
+    }
     state.meta.books = books;
   }
 
-  function invalidateUploadBook() {
-    delete state.books[UPLOAD_BOOK_ID];
-    delete state.bookPromises[UPLOAD_BOOK_ID];
+  function invalidateUploadBook(bookId = "") {
+    if (bookId) {
+      delete state.books[bookId];
+      delete state.bookPromises[bookId];
+      return;
+    }
+    for (const book of personalBooks()) {
+      delete state.books[book.id];
+      delete state.bookPromises[book.id];
+    }
   }
 
   function lowestLibrary(mask) {
@@ -935,18 +1073,19 @@
 
   async function loadBook(id) {
     if (state.books[id]) return state.books[id];
-    if (id === UPLOAD_BOOK_ID) {
-      if (!state.upload || !state.upload.words.length) throw new Error("个人词汇还是空的");
-      const meta = state.meta.books.find((book) => book.id === UPLOAD_BOOK_ID);
+    const personal = personalBook(id);
+    if (personal) {
+      if (!personal.words.length) throw new Error(`「${personal.name}」还没有词`);
+      const meta = state.meta.books.find((book) => book.id === id);
       const data = {
-        id: UPLOAD_BOOK_ID,
-        name: meta ? meta.name : "个人词汇",
+        id,
+        name: personal.name,
         color: meta ? meta.color : "#8a6a3b",
-        words: state.upload.words,
-        _index: new Map(state.upload.words.map((entry, index) => [entry.w, index])),
-        _examples: state.upload.words.filter((entry) => entry.e && !entry.cn),
+        words: personal.words,
+        _index: new Map(personal.words.map((entry, index) => [entry.w, index])),
+        _examples: personal.words.filter((entry) => entry.e && !entry.cn),
       };
-      state.books[UPLOAD_BOOK_ID] = data;
+      state.books[id] = data;
       return data;
     }
     const meta = state.meta.books.find((book) => book.id === id);
@@ -1383,6 +1522,18 @@
       </div>`;
   }
 
+  // 标题旁边挂一个小按钮（目前用于「改名字」）。
+  function sheetHeadEditable(title, subtitle, action) {
+    return `
+      <div class="sheet-head">
+        <div>
+          <h2 id="sheetTitle">${esc(title)}${action || ""}</h2>
+          ${subtitle ? `<p>${esc(subtitle)}</p>` : ""}
+        </div>
+        <button class="sheet-close" type="button" data-close-sheet aria-label="关闭">${ICONS.close}</button>
+      </div>`;
+  }
+
   /* ---------------- chrome ---------------- */
   function updateChrome() {
     const topbar = $("#topbar");
@@ -1508,14 +1659,13 @@
     const sentenceEntry = examples[(Math.floor(Date.now() / DAY) + ui.sentenceSeed) % examples.length];
     const hasExample = Boolean(sentenceEntry && sentenceEntry.e && !sentenceEntry.cn);
     const showInstall = !isStandalone() && !store.settings.installHintDismissed;
+    const manualTarget = resolvePersonalTarget(ui.manualTargetId);
+    ui.manualTargetId = manualTarget ? manualTarget.id : "";
 
-    const bookCards = state.meta.books.map((meta) => {
+    // 第一行固定词库，第二行个人词汇本（可多本、可新建，铅笔进管理页）。
+    const bookCard = (meta, action) => {
       const bStats = progressStats(meta);
       const active = meta.id === book.id;
-      const isUpload = meta.id === UPLOAD_BOOK_ID;
-      const action = isUpload
-        ? `<button class="book-card-action" type="button" data-book-manage aria-label="管理个人词汇">${ICONS.pencil}</button>`
-        : `<button class="book-card-action" type="button" data-book-browse="${escAttr(meta.id)}" aria-label="搜索并浏览${escAttr(meta.name)}">${ICONS.search}</button>`;
       return `
         <div class="book-card-wrap">
           <button class="book-card ${active ? "is-active" : ""}" type="button" data-book="${escAttr(meta.id)}" style="color:${escAttr(meta.color)}">
@@ -1528,11 +1678,21 @@
           </button>
           ${action}
         </div>`;
+    };
+    const fixedCards = state.meta.books
+      .filter((meta) => !meta.personal)
+      .map((meta) => bookCard(meta, `<button class="book-card-action" type="button" data-book-browse="${escAttr(meta.id)}" aria-label="搜索并浏览${escAttr(meta.name)}">${ICONS.search}</button>`))
+      .join("");
+    const personalCards = personalBooks().map((item) => {
+      const meta = state.meta.books.find((entry) => entry.id === item.id) || personalMeta(item, 0);
+      return bookCard(meta, `<button class="book-card-action" type="button" data-book-manage="${escAttr(item.id)}" aria-label="管理${escAttr(item.name)}">${ICONS.pencil}</button>`);
     }).join("");
 
-    const heroSub = targetDone
-      ? (due.length ? `今日新词已完成 · 还有 ${due.length} 个待复习` : "今日任务完成 · 可以自由复习")
-      : `今天还差 ${Math.max(0, target - newCount)} 个新词`;
+    const heroSub = newCount > target
+      ? (due.length ? `已超额 ${newCount - target} 个新词 · 还有 ${due.length} 个待复习` : `已超额 ${newCount - target} 个新词 · 还能继续加练`)
+      : targetDone
+        ? (due.length ? `今日新词已完成 · 还有 ${due.length} 个待复习` : "今日任务完成 · 还可以继续加练")
+        : `今天还差 ${Math.max(0, target - newCount)} 个新词`;
     const heroFoot = accuracy == null
       ? `<span>今天还没有开始</span><span>错词 ${wrong.length} 个</span>`
       : `<span>今日正确率 <strong>${accuracy}%</strong></span><span>待复习 <strong>${due.length}</strong> 个</span>`;
@@ -1563,11 +1723,23 @@
 
       <div class="section-head">
         <h2>学习范围</h2>
-        ${state.upload && state.upload.words.length
-          ? `<button class="mini-btn danger" type="button" data-delete-upload>${ICONS.trash} 清空个人词汇</button>`
-          : `<span class="sub">${esc(book.subtitle)}</span>`}
+        <span class="sub">${esc(book.subtitle)}</span>
       </div>
-      <div class="book-strip">${bookCards}</div>
+      <div class="book-strip">${fixedCards}</div>
+      <div class="book-row-head">
+        <span>我的词汇本</span>
+        <button class="text-btn" type="button" data-new-personal-book>${ICONS.plus} 新建</button>
+      </div>
+      <div class="book-strip personal-strip">
+        ${personalCards}
+        <div class="book-card-wrap">
+          <button class="book-card book-card-add" type="button" data-new-personal-book>
+            <span class="book-card-top"><strong style="color:var(--ink)">新建词汇本</strong></span>
+            <small>自己命名，分开放</small>
+            <span class="book-add-plus">${ICONS.plus}</span>
+          </button>
+        </div>
+      </div>
       <div class="book-meta-row">
         <button class="range-chip" type="button" data-open-range>
           ${esc(rangeLabel(book))}
@@ -1582,16 +1754,18 @@
       </div>
       <div class="mode-grid">
         <button class="mode-card write" type="button" data-mode="zh2en">
-          <span class="mode-icon">${ICONS.pencil}</span>
-          <strong>看中文<br>写英文</strong>
+          <span class="mode-head">
+            <span class="mode-icon">${ICONS.pencil}</span>
+            <strong>看中文写英文</strong>
+          </span>
           <small>听发音 · 拼写 · 手写</small>
-          <span class="mode-arrow">${ICONS.arrow}</span>
         </button>
         <button class="mode-card pick" type="button" data-mode="en2zh">
-          <span class="mode-icon">${ICONS.list}</span>
-          <strong>看英文<br>选中文</strong>
+          <span class="mode-head">
+            <span class="mode-icon">${ICONS.list}</span>
+            <strong>看英文选中文</strong>
+          </span>
           <small>四选一 · 快速识词</small>
-          <span class="mode-arrow">${ICONS.arrow}</span>
         </button>
       </div>
       <p class="mode-note">每天 ${target} 个新词 · 错词自动重复出现</p>
@@ -1609,7 +1783,9 @@
       <div class="manual-add">
         <div class="section-head">
           <h2>手动加词</h2>
+          <span class="sub">先选加到哪一本</span>
         </div>
+        ${bookChipsHTML(ui.manualTargetId, "manual")}
         ${wordSearchHTML({ mode: "manual", placeholder: "输入英文词，拼错也会给出相近词", button: "手动检录" })}
       </div>
 
@@ -1704,14 +1880,15 @@
   }
 
   function renderWordOptions(candidates, mode) {
+    const target = mode === "manual" ? resolvePersonalTarget(ui.manualTargetId) : null;
     const hint = mode === "manual"
-      ? "点右侧按钮，加入或移出个人词汇"
+      ? `点右侧按钮，加入或移出${target ? `「${target.name}」` : "词汇本"}`
       : "点词汇定位到下方列表";
     const head = `<p class="word-search-hint">找到 ${candidates.length} 个相近词 · ${hint}</p>`;
     const items = candidates.map(({ w, p, m }) => {
       const meaning = shortMeaning(m) || "暂无释义";
       if (mode === "manual") {
-        const added = inPersonalWords(w);
+        const added = target ? inBook(target.id, w) : inPersonalWords(w);
         return `<div class="word-option">
           <span class="word-option-copy"><strong>${esc(w)}</strong><small>${esc(meaning)}</small></span>
           <button class="word-option-action${added ? " is-added" : ""}" type="button"
@@ -1760,7 +1937,8 @@
       const book = state.books[root.dataset.bookId];
       entries = book ? book.words : [];
     } else if (mode === "manage") {
-      entries = (state.upload && state.upload.words) || [];
+      const book = personalBook(root.dataset.bookId) || personalBook(ui.manageBookId) || activePersonalBook();
+      entries = book ? book.words : [];
     }
     if (token !== ui.wordSearchToken) return;
     const candidates = searchWordCandidates(raw, entries, 10);
@@ -1777,11 +1955,17 @@
   function handleManualToggle(word, button) {
     if (!word || !button) return;
     const entry = { w: word, p: button.dataset.ph || "", m: button.dataset.m || "暂无释义" };
-    if (inPersonalWords(word)) removeWordFromPersonal(word, null, true);
-    else addWordToPersonal(entry, null, true);
-    const added = inPersonalWords(word);
+    const target = resolvePersonalTarget(ui.manualTargetId);
+    if (!target) addWordToPersonal(entry, null, true);
+    else if (inBook(target.id, word)) removeWordFromPersonal(word, null, true, target.id);
+    else addWordToPersonal(entry, null, true, target.id);
+    const added = target ? inBook(target.id, word) : inPersonalWords(word);
     button.classList.toggle("is-added", added);
     button.innerHTML = added ? `${ICONS.minus} 移出` : `${ICONS.plus} 加入`;
+    // 词汇本词数变了，顺手刷新 chips 上的计数。
+    const row = $('[data-target-row="manual"]');
+    const activeId = (resolvePersonalTarget(ui.manualTargetId) || {}).id || "";
+    if (row) row.outerHTML = bookChipsHTML(activeId, "manual");
   }
 
   function jumpToWordRow(word) {
@@ -1799,16 +1983,199 @@
   }
 
   /* ---------------- wrong words ---------------- */
+  // 把「上次错在哪」画出来：拼写题高亮写错/漏掉的字母，选择题显示选成了哪个词。
+  function spellSplit(input, target) {
+    const a = String(input || "").toLowerCase();
+    const b = String(target || "").toLowerCase();
+    let head = 0;
+    while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+    let tail = 0;
+    while (
+      tail < a.length - head
+      && tail < b.length - head
+      && a[a.length - 1 - tail] === b[b.length - 1 - tail]
+    ) tail += 1;
+    return { head, tail };
+  }
+
+  function spellDiffHTML(input, target) {
+    const typed = String(input || "").trim();
+    if (!typed) return "";
+    const right = String(target || "").toLowerCase();
+    if (typed.toLowerCase() === right) return `<span class="spell-typed">${esc(typed)}</span>`;
+    const { head, tail } = spellSplit(typed, right);
+    return `<span class="spell-typed">${esc(typed.slice(0, head))}<em>${esc(typed.slice(head, typed.length - tail))}</em>${esc(typed.slice(typed.length - tail))}</span>`;
+  }
+
+  // 正确词里把「你漏掉/多写」的那一段标出来，配合上面的错误写法看。
+  function spellTargetHTML(input, target) {
+    const typed = String(input || "").trim();
+    const right = String(target || "");
+    if (!typed) return esc(right);
+    const { head, tail } = spellSplit(typed, right);
+    const headPart = right.slice(0, head);
+    const middle = right.slice(head, right.length - tail);
+    const tailPart = right.slice(right.length - tail);
+    if (!middle) return esc(right);
+    return `${esc(headPart)}<em>${esc(middle)}</em>${esc(tailPart)}`;
+  }
+
+  function wrongAttemptHTML(item, word) {
+    const wrong = item && item.lastWrong;
+    if (!wrong) return "";
+    if (wrong.revealed) {
+      return `<div class="wrong-attempt"><span class="wrong-attempt-label">上次直接看了答案</span></div>`;
+    }
+    const input = String(wrong.input || "").trim();
+    if (!input) return "";
+    if (wrong.mode === "en2zh") {
+      return `<div class="wrong-attempt">
+          <span class="wrong-attempt-label">上次选成</span>
+          <span class="wrong-attempt-text">${esc(shortMeaning(input) || input)}</span>
+        </div>`;
+    }
+    return `<div class="wrong-attempt">
+        <span class="wrong-attempt-label">上次写成</span>
+        ${spellDiffHTML(input, word)}
+        <span class="wrong-attempt-arrow">→</span>
+        <strong class="wrong-attempt-right">${spellTargetHTML(input, word)}</strong>
+      </div>`;
+  }
+
+  function updateWrongBatchUI() {
+    const boxes = $$("#view [data-wrong-select]");
+    const selected = ui.wrongSelected;
+    const button = $("#view [data-wrong-delete]");
+    if (button) {
+      button.disabled = selected.size === 0;
+      button.textContent = selected.size ? `删除 ${selected.size} 词` : "删除选中";
+    }
+    const all = $("#view [data-wrong-select-all]");
+    if (all) all.checked = boxes.length > 0 && selected.size === boxes.length;
+    $$("#view [data-wrong-row]").forEach((row) => {
+      row.classList.toggle("is-selected", selected.has(row.dataset.wrongKey));
+    });
+  }
+
+  function deleteSelectedWrong() {
+    if (!ui.wrongSelected.size) return;
+    const keys = [...ui.wrongSelected].map((key) => {
+      const cut = key.indexOf("|");
+      return cut > 0 ? { bookId: key.slice(0, cut), word: key.slice(cut + 1) } : null;
+    }).filter(Boolean);
+    if (!keys.length) return;
+    if (!confirm(`从错词本删除选中的 ${keys.length} 个词？`)) return;
+    for (const { bookId, word } of keys) {
+      const progress = progressFor(bookId);
+      const item = progress[word];
+      if (!item) continue;
+      item.mastered = true;
+      item.wrongCount = 0;
+      item.level = 5;
+      item.rightStreak = 0;
+      item.due = Date.now() + 3650 * DAY;
+    }
+    saveStore();
+    ui.wrongSelected = new Set();
+    renderWrong();
+    updateChrome();
+    toast(`已删除 ${keys.length} 个错词`);
+  }
+
+  // 错词散在各本的 progress 里，先按本聚合，好做「切换词汇本 / 所有」。
+  function wrongCountFor(bookId) {
+    const progress = store.progress[bookId];
+    if (!progress || typeof progress !== "object") return 0;
+    let count = 0;
+    for (const word of Object.keys(progress)) {
+      const item = progress[word];
+      if (item && (item.wrongCount || 0) > 0 && !item.mastered) count += 1;
+    }
+    return count;
+  }
+
+  function dictEntryFor(word) {
+    const row = state.dict && state.dict[word];
+    if (row) return { w: word, p: row[0] || "", m: row[1] || "暂无释义" };
+    return { w: word, p: "", m: "暂无释义" };
+  }
+
+  function wrongSort(a, b) {
+    return (a.item.due || 0) - (b.item.due || 0)
+      || (b.item.wrongCount || 0) - (a.item.wrongCount || 0)
+      || (b.item.last || 0) - (a.item.last || 0);
+  }
+
+  // 某一本的错词。词库还没加载时用离线词典兜底，保证列表不空。
+  function wrongListForBook(bookId) {
+    const progress = store.progress[bookId] || {};
+    const book = state.books[bookId];
+    const personal = personalBook(bookId);
+    const words = book ? book.words : (personal ? personal.words : []);
+    const out = [];
+    const seen = new Set();
+    for (const entry of words) {
+      const item = progress[entry.w];
+      if (item && (item.wrongCount || 0) > 0 && !item.mastered) {
+        out.push({ bookId, entry, item });
+        seen.add(entry.w);
+      }
+    }
+    for (const word of Object.keys(progress)) {
+      if (seen.has(word)) continue;
+      const item = progress[word];
+      if (!item || !(item.wrongCount > 0) || item.mastered) continue;
+      out.push({ bookId, entry: dictEntryFor(word), item });
+    }
+    return out.sort(wrongSort);
+  }
+
+  function wrongScopes() {
+    return state.meta.books
+      .map((meta) => ({ id: meta.id, name: meta.short || meta.name, color: meta.color, count: wrongCountFor(meta.id) }))
+      .filter((scope) => scope.count > 0);
+  }
+
+  function wrongListForScope(scopeId) {
+    const ids = scopeId ? [scopeId] : state.meta.books.map((meta) => meta.id);
+    let out = [];
+    for (const id of ids) out = out.concat(wrongListForBook(id));
+    return out.sort(wrongSort);
+  }
+
+  function wrongScopeChipsHTML(scopes, active, total) {
+    if (!scopes.length) return "";
+    const chips = scopes.map((scope) => `
+      <button class="wrong-scope ${scope.id === active ? "is-active" : ""}" type="button" data-wrong-scope="${escAttr(scope.id)}">
+        <i class="wrong-scope-dot" style="background:${escAttr(scope.color)}"></i>${esc(scope.name)}<em>${scope.count}</em>
+      </button>`).join("");
+    return `
+      <div class="wrong-scopes">
+        <button class="wrong-scope ${active ? "" : "is-active"}" type="button" data-wrong-scope="">
+          所有<em>${total}</em>
+        </button>
+        ${chips}
+      </div>`;
+  }
+
   function renderWrong() {
     const book = currentBook();
     if (!book) {
       renderBookGate("wrong");
       return;
     }
-    const list = wrongEntries(book);
-    const due = dueWords(book).filter((item) => (item.item.wrongCount || 0) > 0).length;
+    const scopes = wrongScopes();
+    // 选中的那一本已经没错了（或已被删掉）就退回「所有」。
+    if (ui.wrongScope && !scopes.some((scope) => scope.id === ui.wrongScope)) ui.wrongScope = "";
+    const total = scopes.reduce((sum, scope) => sum + scope.count, 0);
+    const list = wrongListForScope(ui.wrongScope);
+    const scopeMeta = ui.wrongScope ? state.meta.books.find((meta) => meta.id === ui.wrongScope) : null;
+    const scopeName = scopeMeta ? scopeMeta.name : "所有词汇本";
+    const now = Date.now();
+    const due = list.filter(({ item }) => Number(item.due) <= now).length;
+    ui.wrongSelected = new Set();
 
-    if (!list.length) {
+    if (!total) {
       $("#view").innerHTML = `
         <div class="page-head">
           <div><h2>错词本</h2><p>${esc(book.name)} · 反复练，直到记住</p></div>
@@ -1817,14 +2184,36 @@
         <div class="empty-state">
           <div class="empty-icon">${ICONS.check}</div>
           <h3>还没有错词</h3>
-          <p>练习中答错的单词会自动收进这里，之后会优先安排复习。</p>
+          <p>练习中答错的单词会自动收进这里，并记下当时写错的样子。</p>
           <button class="primary-btn" type="button" data-go-home>去练习</button>
         </div>`;
       return;
     }
 
-    const items = list.map(({ entry, item }) => `
-      <article class="wrong-item">
+    const head = `
+      <div class="page-head">
+        <div><h2>错词本</h2><p>${esc(scopeName)} · ${due ? `${due} 个今天到期` : "按遗忘规律安排复习"}</p></div>
+        <div class="count-badge"><strong>${list.length}</strong><span>错词</span></div>
+      </div>
+      ${wrongScopeChipsHTML(scopes, ui.wrongScope, total)}`;
+
+    if (!list.length) {
+      $("#view").innerHTML = `
+        ${head}
+        <div class="empty-state">
+          <div class="empty-icon">${ICONS.check}</div>
+          <h3>这一本还没有错词</h3>
+          <p>切到「所有」可以看到其它词汇本的错词。</p>
+          <button class="primary-btn" type="button" data-wrong-scope="">看所有错词</button>
+        </div>`;
+      return;
+    }
+
+    const items = list.map(({ entry, item, bookId }) => {
+      const key = `${bookId}|${entry.w}`;
+      return `
+      <article class="wrong-item" data-wrong-row="${escAttr(entry.w)}" data-wrong-key="${escAttr(key)}">
+        <input class="wrong-check" type="checkbox" data-wrong-select value="${escAttr(key)}" aria-label="选择 ${escAttr(entry.w)}">
         <div class="wrong-item-top">
           <div>
             <button class="wrong-word" type="button" data-word="${escAttr(entry.w)}">${esc(entry.w)}</button>
@@ -1833,23 +2222,27 @@
           <button class="mini-btn" type="button" data-speak="${escAttr(entry.w)}" aria-label="朗读 ${escAttr(entry.w)}">${ICONS.speaker}</button>
         </div>
         <div class="wrong-meaning">${esc(entry.m)}</div>
+        ${wrongAttemptHTML(item, entry.w)}
         <div class="wrong-foot">
-          <small>错 ${item.wrongCount || 1} 次 · ${formatWhen(item.last)}</small>
+          <small>${ui.wrongScope ? "" : `${esc((state.meta.books.find((meta) => meta.id === bookId) || {}).short || "")} · `}错 ${item.wrongCount || 1} 次 · ${formatWhen(item.last)}</small>
           <div class="mini-actions">
             <button class="mini-btn" type="button" data-word="${escAttr(entry.w)}">${ICONS.eye} 例句</button>
-            <button class="mini-btn danger" type="button" data-remove-word="${escAttr(entry.w)}">移除</button>
+            <button class="mini-btn danger" type="button" data-remove-word="${escAttr(key)}">移除</button>
           </div>
         </div>
-      </article>`).join("");
+      </article>`;
+    }).join("");
 
     $("#view").innerHTML = `
-      <div class="page-head">
-        <div><h2>错词本</h2><p>${esc(book.name)} · ${due ? `${due} 个今天到期` : "按遗忘规律安排复习"}</p></div>
-        <div class="count-badge"><strong>${list.length}</strong><span>错词</span></div>
-      </div>
+      ${head}
       <div class="wrong-actions">
         <button class="primary-btn" type="button" data-wrong-mode="zh2en">写英文复习</button>
         <button class="ghost-btn" type="button" data-wrong-mode="en2zh">选中文</button>
+      </div>
+      <div class="wrong-batch">
+        <label class="wrong-batch-all"><input type="checkbox" data-wrong-select-all> 全选</label>
+        <span class="wrong-batch-hint">勾选后可以批量删除</span>
+        <button class="mini-btn danger" type="button" data-wrong-delete disabled>删除选中</button>
       </div>
       <div class="wrong-list">${items}</div>
       <p class="tip-line">答对会逐步延长复习间隔<br>连续答对后自动移出错词本</p>`;
@@ -1989,10 +2382,10 @@
           </div>
         </div>
         <div class="setting-row">
-          <div class="setting-copy"><strong>每天复习</strong><small>到期错词和旧词的复习上限</small></div>
+          <div class="setting-copy"><strong>每天复习</strong><small>到期错词和旧词的复习上限，选 0 就是今天不复习</small></div>
           <div class="segmented" role="group" aria-label="每天复习数量">
-            ${[10, 20, 30, 50].map((value) => `
-              <button type="button" data-setting="dailyReview" data-value="${value}" class="${store.settings.dailyReview === value ? "is-active" : ""}">${value}</button>`).join("")}
+            ${[0, 10, 20, 30, 50].map((value) => `
+              <button type="button" data-setting="dailyReview" data-value="${value}" aria-label="${value === 0 ? "不复习" : `复习 ${value} 个`}" class="${store.settings.dailyReview === value ? "is-active" : ""}">${value}</button>`).join("")}
           </div>
         </div>
         <div class="setting-row">
@@ -2009,16 +2402,16 @@
       </div>
 
       <div class="settings-group">
-        <div class="settings-title">个人词汇</div>
+        <div class="settings-title">词汇本</div>
         <div class="setting-row">
           <div class="setting-copy">
-            <strong>个人词汇</strong>
-            <small>${state.upload
-              ? `${uploadStats().total} 词 · 答题时点「加入个人词汇」或上传试卷都能加进来`
-              : "答题时点「加入个人词汇」，或上传试卷批量提取"}</small>
+            <strong>个人词汇本</strong>
+            <small>${personalBooks().length
+              ? `${personalBooks().length} 本 · 共 ${personalWordTotal()} 词 · 答题时点「加入词汇本」或上传试卷都能加进来`
+              : "答题时点「加入词汇本」，或上传试卷批量提取"}</small>
           </div>
           <div class="data-actions">
-            ${state.upload ? `<button class="mini-btn" type="button" data-action="manage-upload">查看</button>` : ""}
+            ${personalBooks().length ? `<button class="mini-btn" type="button" data-action="manage-upload">管理</button>` : ""}
             <button class="mini-btn" type="button" data-action="upload-file">${ICONS.upload} 上传试卷</button>
           </div>
         </div>
@@ -2173,12 +2566,26 @@
     openInstallHelp();
   }
 
-  /* ---------------- 数据导入导出（可选范围） ---------------- */
-  const DATA_SCOPES = [
-    { id: "personal", label: "个人词汇", hint: "收进来的词，带音标、释义和例句" },
-    { id: "wrong", label: "错词", hint: "答错还没记牢的词和复习时间" },
-    { id: "records", label: "学习记录", hint: "全部进度、每日统计、历史与设置" },
-  ];
+  /* ---------------- 数据导入导出（按词汇本拆分） ---------------- */
+  // 每个个人词汇本、每个有错词的词库都是一项：可以单独勾一本导出，也可以整组全选。
+  function personalScopeId(bookId) {
+    return `personal:${bookId}`;
+  }
+
+  function wrongScopeId(bookId) {
+    return `wrong:${bookId}`;
+  }
+
+  function scopeCategory(id) {
+    const raw = String(id || "");
+    const cut = raw.indexOf(":");
+    return cut > 0 ? raw.slice(0, cut) : raw;
+  }
+
+  function bookLabel(bookId) {
+    const meta = state.meta.books.find((item) => item.id === bookId);
+    return meta ? (meta.name || meta.short || bookId) : bookId;
+  }
 
   // 错词散在各个词库的 progress 里，集中抽出来便于单独导出。
   function wrongWordsFrom(progress) {
@@ -2191,7 +2598,7 @@
         const item = map[word];
         if (!item || typeof item !== "object") continue;
         if (!(item.wrongCount > 0) || item.mastered) continue;
-        out.push({ b: bookId, w: word, i: item });
+        out.push({ b: bookId, n: bookLabel(bookId), w: word, i: item });
       }
     }
     return out;
@@ -2201,20 +2608,36 @@
     return wrongWordsFrom(store.progress);
   }
 
-  function dataScopeInfo() {
-    const personal = (state.upload && state.upload.words) || [];
-    const wrong = collectWrongWords();
-    const books = store.progress && typeof store.progress === "object" ? store.progress : {};
-    let seen = 0;
-    for (const bookId of Object.keys(books)) {
-      if (books[bookId] && typeof books[bookId] === "object") seen += Object.keys(books[bookId]).length;
-    }
-    const sessions = Array.isArray(store.history) ? store.history.length : 0;
-    return {
-      personal: { count: personal.length, note: `${personal.length} 词` },
-      wrong: { count: wrong.length, note: `${wrong.length} 个待复习` },
-      records: { count: seen, note: `已学 ${seen} 词 · 练习 ${sessions} 次` },
-    };
+  function dataExportGroups() {
+    const personal = personalBooks().map((book) => ({
+      id: personalScopeId(book.id),
+      label: book.name,
+      hint: `${book.words.length} 词`,
+      count: book.words.length,
+    }));
+    const wrong = state.meta.books
+      .map((meta) => ({
+        id: wrongScopeId(meta.id),
+        label: meta.short || meta.name,
+        count: wrongCountFor(meta.id),
+      }))
+      .filter((row) => row.count > 0)
+      .map((row) => ({ ...row, hint: `${row.count} 个待复习` }));
+    return { personal, wrong };
+  }
+
+  function allScopeIds() {
+    const groups = dataExportGroups();
+    return [...groups.personal, ...groups.wrong].map((row) => row.id).concat(["records"]);
+  }
+
+  function scopeLabel(id) {
+    if (id === "records") return "学习记录";
+    const cut = id.indexOf(":");
+    const cat = id.slice(0, cut);
+    const target = id.slice(cut + 1);
+    const label = bookLabel(target);
+    return cat === "personal" ? label : `${label} 错词`;
   }
 
   function scopedPayload(scopes) {
@@ -2225,8 +2648,22 @@
       exportedAt: new Date().toISOString(),
       scopes: [...set],
     };
-    if (set.has("personal")) payload.upload = state.upload || null;
-    if (set.has("wrong")) payload.wrong = collectWrongWords();
+    const personalIds = new Set([...set]
+      .filter((id) => id.startsWith("personal:"))
+      .map((id) => id.slice("personal:".length)));
+    const wrongIds = new Set([...set]
+      .filter((id) => id.startsWith("wrong:"))
+      .map((id) => id.slice("wrong:".length)));
+    if (set.has("personal")) personalBooks().forEach((book) => personalIds.add(book.id));
+    if (set.has("wrong")) collectWrongWords().forEach((row) => wrongIds.add(row.b));
+    if (personalIds.size && personalBooks().length) {
+      payload.personal = {
+        version: 2,
+        books: personalBooks().filter((book) => personalIds.has(book.id)),
+        lastUsedId: state.personal.lastUsedId,
+      };
+    }
+    if (wrongIds.size) payload.wrong = collectWrongWords().filter((row) => wrongIds.has(row.b));
     if (set.has("records")) payload.data = store;
     return payload;
   }
@@ -2247,59 +2684,108 @@
     }
   }
 
-  function openDataTransferSheet() {
-    const info = dataScopeInfo();
-    const rows = DATA_SCOPES.map((scope) => `
-      <label class="scope-row">
-        <input type="checkbox" data-scope="${scope.id}" checked>
+  function scopeRowHTML(id, label, hint, child = true) {
+    return `
+      <label class="scope-row${child ? " is-child" : ""}">
+        <input type="checkbox" data-scope="${escAttr(id)}" checked>
         <span class="scope-text">
-          <strong>${scope.label}</strong>
-          <small>${scope.hint}</small>
+          <strong>${esc(label)}</strong>
+          ${hint ? `<small>${esc(hint)}</small>` : ""}
         </span>
-        <span class="scope-meta">${esc(info[scope.id].note)}</span>
-      </label>`).join("");
+      </label>`;
+  }
+
+  function scopeGroupHeadHTML(group, label, hint, meta) {
+    return `
+      <label class="scope-row is-group">
+        <input type="checkbox" data-group="${escAttr(group)}" checked>
+        <span class="scope-text"><strong>${esc(label)}</strong><small>${esc(hint)}</small></span>
+        <span class="scope-meta">${esc(meta)}</span>
+      </label>`;
+  }
+
+  function openDataTransferSheet() {
+    const groups = dataExportGroups();
+    const personalWords = groups.personal.reduce((sum, row) => sum + (row.count || 0), 0);
+    const wrongTotal = groups.wrong.reduce((sum, row) => sum + (row.count || 0), 0);
+    const personalBlock = groups.personal.length
+      ? `${scopeGroupHeadHTML("personal", "个人词汇", "按词汇本分开导出，也可以只勾一本", `${groups.personal.length} 本 · ${personalWords} 词`)}
+         ${groups.personal.map((row) => scopeRowHTML(row.id, row.label, row.hint)).join("")}`
+      : `<div class="scope-row is-group is-empty">
+           <span class="scope-text"><strong>个人词汇</strong><small>还没有词汇本，先自己建一本</small></span>
+         </div>`;
+    const wrongBlock = groups.wrong.length
+      ? `${scopeGroupHeadHTML("wrong", "错词", "每个词库的错词可以分开导出", `${wrongTotal} 个待复习`)}
+         ${groups.wrong.map((row) => scopeRowHTML(row.id, row.label, row.hint)).join("")}`
+      : `<div class="scope-row is-group is-empty">
+           <span class="scope-text"><strong>错词</strong><small>现在没有待复习的错词</small></span>
+         </div>`;
     openSheet(`
       ${sheetHead("数据导入导出", "先选范围，再导出或导入")}
       <div class="scope-list">
-        ${rows}
+        <div class="scope-group">${personalBlock}</div>
+        <div class="scope-group">${wrongBlock}</div>
+        ${scopeRowHTML("records", "学习记录", "全部进度、每日统计、历史与设置", false)}
         <label class="scope-row is-all">
-          <input type="checkbox" data-scope="all" checked>
-          <span class="scope-text"><strong>全部</strong><small>个人词汇 + 错词 + 学习记录</small></span>
-          <span class="scope-meta">${scopeSize(["personal", "wrong", "records"])}</span>
+          <input type="checkbox" data-scope-all checked>
+          <span class="scope-text"><strong>全部</strong><small>所有词汇本 + 错词 + 学习记录</small></span>
+          <span class="scope-meta" data-scope-total>${scopeSize(allScopeIds())}</span>
         </label>
       </div>
       <div class="upload-pick-actions">
         <button class="primary-btn" type="button" data-data-export>${ICONS.download} 导出全部数据</button>
         <button class="ghost-btn" type="button" data-data-import>${ICONS.upload} 选文件导入</button>
       </div>
-      <div class="sheet-note">导出一个 JSON 文件，换设备时把它拷过去导入即可。<br>导入时「个人词汇」和「错词」按词合并，已有的不会重复；勾了「学习记录」会用文件里的进度、统计和设置覆盖本机。</div>
+      <div class="sheet-note">导出一个 JSON 文件，换设备时把它拷过去导入即可。<br>只勾一本词汇本，导出的文件里就只有那一本；错词同理。<br>导入时「词汇本」和「错词」按词合并，已有的不会重复；勾了「学习记录」会用文件里的进度、统计和设置覆盖本机。</div>
     `, { focus: false });
     updateDataTransferUI();
   }
 
   function scopeCheckboxes() {
-    return Array.from(document.querySelectorAll("#sheetContent [data-scope]"))
-      .filter((box) => box.dataset.scope !== "all");
+    return $$("#sheetContent [data-scope]");
   }
 
   function selectedScopes() {
     return scopeCheckboxes().filter((box) => box.checked).map((box) => box.dataset.scope);
   }
 
-  function updateDataTransferUI() {
-    const chosen = selectedScopes();
-    const allBox = document.querySelector('#sheetContent [data-scope="all"]');
-    if (allBox) allBox.checked = chosen.length === DATA_SCOPES.length;
-    const button = document.querySelector("#sheetContent [data-data-export]");
-    if (!button) return;
-    button.disabled = chosen.length === 0;
-    if (!chosen.length) button.innerHTML = "请先选择数据";
-    else if (chosen.length === DATA_SCOPES.length) button.innerHTML = `${ICONS.download} 导出全部数据`;
-    else button.innerHTML = `${ICONS.download} 导出所选 ${chosen.length} 项`;
+  function syncScopeGroupStates() {
+    $$("#sheetContent [data-group]").forEach((group) => {
+      const key = group.dataset.group;
+      const children = scopeCheckboxes().filter((box) => scopeCategory(box.dataset.scope) === key);
+      const on = children.filter((box) => box.checked).length;
+      group.checked = children.length > 0 && on === children.length;
+      group.indeterminate = on > 0 && on < children.length;
+    });
+    const allBox = $("#sheetContent [data-scope-all]");
+    if (allBox) {
+      const chosen = selectedScopes().length;
+      const total = allScopeIds().length;
+      allBox.checked = chosen > 0 && chosen === total;
+      allBox.indeterminate = chosen > 0 && chosen < total;
+    }
   }
 
-  function exportData(scopes = DATA_SCOPES.map((scope) => scope.id)) {
-    const chosen = DATA_SCOPES.map((scope) => scope.id).filter((id) => scopes.includes(id));
+  function updateDataTransferUI() {
+    syncScopeGroupStates();
+    const chosen = selectedScopes();
+    const button = $("#sheetContent [data-data-export]");
+    if (!button) return;
+    const total = allScopeIds().length;
+    button.disabled = chosen.length === 0;
+    if (!chosen.length) button.innerHTML = "请先选择数据";
+    else if (chosen.length === total) button.innerHTML = `${ICONS.download} 导出全部数据`;
+    else button.innerHTML = `${ICONS.download} 导出所选 ${chosen.length} 项`;
+    const totalEl = $("#sheetContent [data-scope-total]");
+    if (totalEl) totalEl.textContent = scopeSize(chosen);
+  }
+
+  function safeFileName(name) {
+    return String(name || "").replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 24) || "selected";
+  }
+
+  function exportData(scopes = allScopeIds()) {
+    const chosen = allScopeIds().filter((id) => scopes.includes(id));
     if (!chosen.length) {
       toast("先选择要导出的数据", true);
       return;
@@ -2308,33 +2794,59 @@
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    const tag = chosen.length === DATA_SCOPES.length ? "backup" : chosen.join("-");
+    const total = allScopeIds().length;
+    let tag = "selected";
+    if (chosen.length === total) tag = "backup";
+    else if (chosen.length === 1) {
+      const id = chosen[0];
+      if (id === "records") tag = "records";
+      else if (id.startsWith("personal:")) tag = `personal-${safeFileName(bookLabel(id.slice(9)))}`;
+      else tag = `wrong-${safeFileName(bookLabel(id.slice(6)))}`;
+    }
     link.href = url;
     link.download = `citing-${tag}-${todayKey()}.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 3000);
-    const labels = DATA_SCOPES.filter((scope) => chosen.includes(scope.id)).map((scope) => scope.label);
-    toast(`已导出：${labels.join("、")}`);
+    toast(`已导出：${chosen.map(scopeLabel).join("、")}`);
   }
 
   // 兼容旧备份：没有 scopes 字段时，按文件里实际有的内容推断。
   function availableScopes(parsed) {
     const out = [];
-    if (parsed && parsed.upload && Array.isArray(parsed.upload.words)) out.push("personal");
+    const hasPersonal = Boolean(parsed && (
+      (parsed.personal && Array.isArray(parsed.personal.books))
+      || (parsed.upload && Array.isArray(parsed.upload.words))
+    ));
+    if (hasPersonal) out.push("personal");
     // 旧备份没有单独的 wrong 字段，错词藏在 data.progress 里，也能单独取出来。
     if (parsed && (Array.isArray(parsed.wrong) || (parsed.data && parsed.data.progress))) out.push("wrong");
     if (parsed && parsed.data && typeof parsed.data === "object") out.push("records");
     return out;
   }
 
+  // 个人本的 id 换设备会变，错词行里带了词汇本名字，可以按名字找回来。
+  function resolveWrongBookId(row) {
+    const id = row.b;
+    if (!id) return "";
+    if (state.meta.books.some((meta) => meta.id === id)) return id;
+    if (row.n) {
+      const byName = personalBooks().find((book) => book.name === row.n);
+      if (byName) return byName.id;
+      const meta = state.meta.books.find((item) => (item.name || item.short) === row.n);
+      if (meta) return meta.id;
+    }
+    return id;
+  }
+
   function mergeWrongWords(list) {
     let added = 0;
     for (const row of list) {
-      if (!row || !row.b || !row.w) continue;
-      if (!store.progress[row.b] || typeof store.progress[row.b] !== "object") store.progress[row.b] = {};
-      const map = store.progress[row.b];
+      const bookId = resolveWrongBookId(row);
+      if (!bookId || !row.w) continue;
+      if (!store.progress[bookId] || typeof store.progress[bookId] !== "object") store.progress[bookId] = {};
+      const map = store.progress[bookId];
       const incoming = row.i && typeof row.i === "object" ? row.i : {};
       const existing = map[row.w];
       if (!existing) {
@@ -2360,52 +2872,128 @@
     return added;
   }
 
-  function mergePersonalFrom(section) {
-    const words = Array.isArray(section && section.words) ? section.words.filter((entry) => entry && entry.w) : [];
-    if (!words.length) return 0;
-    const result = mergeUpload(words, "", { manual: true });
-    const files = Array.isArray(section.files) ? section.files : [];
-    if (files.length) {
-      const known = new Set((result.upload.files || []).map((file) => `${file.name}|${file.at}`));
-      for (const file of files) {
-        if (!file || known.has(`${file.name}|${file.at}`)) continue;
-        result.upload.files.push(file);
+  // 导入个人词汇：新备份按词汇本逐本合并（同名合并、没有名字就新建），
+  // 老备份只有一组 words，统一并进「个人词汇」这一本。
+  // nameFilter 有值时只导入这几本（对应「只勾了某一本」）。
+  function mergePersonalFrom(section, nameFilter = null) {
+    if (!section || typeof section !== "object") return 0;
+    let incoming = Array.isArray(section.books)
+      ? section.books
+        .filter((book) => book && Array.isArray(book.words))
+        .map((book) => ({
+          name: String(book.name || "个人词汇").trim().slice(0, PERSONAL_NAME_MAX) || "个人词汇",
+          words: book.words,
+          files: book.files,
+        }))
+      : (Array.isArray(section.words)
+        ? [{ name: "个人词汇", words: section.words, files: section.files }]
+        : []);
+    if (nameFilter) incoming = incoming.filter((item) => nameFilter.has(item.name));
+    let total = 0;
+    for (const item of incoming) {
+      const words = item.words.filter((entry) => entry && entry.w);
+      if (!words.length) continue;
+      let target = personalBooks().find((book) => book.name === item.name);
+      if (!target) {
+        try {
+          target = createPersonalBook(item.name);
+        } catch (error) {
+          target = personalBooks()[0] || null;
+        }
       }
-      result.upload.files = result.upload.files.slice(0, 20);
+      if (!target) continue;
+      const result = mergeUpload(words, "", { manual: true, bookId: target.id });
+      const files = Array.isArray(item.files) ? item.files : [];
+      if (files.length) {
+        const known = new Set((target.files || []).map((file) => `${file.name}|${file.at}`));
+        for (const file of files) {
+          if (!file || known.has(`${file.name}|${file.at}`)) continue;
+          target.files.push(file);
+        }
+        target.files = target.files.slice(0, 20);
+      }
+      total += result.added;
     }
-    saveUpload(result.upload);
-    state.upload = result.upload;
+    try {
+      savePersonal();
+    } catch (error) {
+      console.warn("Failed to save imported personal vocabulary", error);
+    }
     invalidateUploadBook();
     syncUploadBookMeta();
-    return result.added;
+    return total;
+  }
+
+  // 把勾选的范围翻译成「导哪几本」。
+  function importSelection(scopes) {
+    const ids = new Set(scopes);
+    const sel = {
+      records: ids.has("records"),
+      allPersonal: ids.has("personal"),
+      allWrong: ids.has("wrong"),
+      personalNames: new Set(),
+      wrongNames: new Set(),
+      wrongIds: new Set(),
+    };
+    for (const id of ids) {
+      const cut = String(id).indexOf(":");
+      if (cut < 0) continue;
+      const cat = id.slice(0, cut);
+      const sub = id.slice(cut + 1);
+      if (cat === "personal") {
+        const book = personalBook(sub);
+        if (book) sel.personalNames.add(book.name);
+        else sel.allPersonal = true;
+      } else if (cat === "wrong") {
+        const meta = state.meta.books.find((item) => item.id === sub);
+        sel.wrongIds.add(sub);
+        if (meta) sel.wrongNames.add(meta.name || meta.short);
+      }
+    }
+    return sel;
   }
 
   function applyImport(parsed, scopes) {
-    const chosen = availableScopes(parsed).filter((id) => scopes.includes(id));
-    if (!chosen.length) return { ok: false, message: "文件里没有你选中的数据" };
+    const available = availableScopes(parsed);
+    const sel = importSelection(scopes);
+    const wantsPersonal = sel.allPersonal || sel.personalNames.size > 0;
+    const wantsWrong = sel.allWrong || sel.wrongNames.size > 0;
+    if (!(sel.records && available.includes("records"))
+      && !(wantsPersonal && available.includes("personal"))
+      && !(wantsWrong && available.includes("wrong"))) {
+      return { ok: false, message: "文件里没有你选中的数据" };
+    }
     const parts = [];
-    const recordsApplied = chosen.includes("records");
-    if (recordsApplied) {
+    let recordsApplied = false;
+    if (sel.records && available.includes("records")) {
       store = loadStoreFrom(parsed.data);
       saveStore();
+      recordsApplied = true;
       parts.push("学习记录");
     }
     // 学习记录里已经带着错词，重复合并没有意义。
-    if (chosen.includes("wrong") && !recordsApplied) {
-      const list = Array.isArray(parsed.wrong)
+    if (!recordsApplied && wantsWrong && available.includes("wrong")) {
+      let list = Array.isArray(parsed.wrong)
         ? parsed.wrong
         : wrongWordsFrom(parsed.data && parsed.data.progress);
-      const added = mergeWrongWords(list);
-      parts.push(`错词 ${list.length} 个（新增 ${added}）`);
+      if (!sel.allWrong) {
+        list = list.filter((row) => sel.wrongIds.has(row.b) || (row.n && sel.wrongNames.has(row.n)));
+      }
+      if (list.length) {
+        const added = mergeWrongWords(list);
+        parts.push(`错词 ${list.length} 个（新增 ${added}）`);
+      }
     }
-    if (chosen.includes("personal")) {
-      const added = mergePersonalFrom(parsed.upload);
+    if (wantsPersonal && available.includes("personal")) {
+      const section = parsed.personal || parsed.upload || null;
+      const added = mergePersonalFrom(section, sel.allPersonal ? null : sel.personalNames);
       parts.push(`个人词汇 +${added} 词`);
     }
+    if (!parts.length) return { ok: false, message: "选中的内容在文件里是空的" };
     return { ok: true, message: parts.join(" · ") };
   }
 
-  function importData(scopes = DATA_SCOPES.map((scope) => scope.id)) {
+  function importData(scopes = allScopeIds()) {
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "application/json,.json";
@@ -2424,11 +3012,12 @@
           toast("这个文件不是有效的词听备份", true);
           return;
         }
-        if (!available.some((id) => scopes.includes(id))) {
+        const chosenCats = new Set(scopes.map(scopeCategory));
+        if (!available.some((id) => chosenCats.has(id))) {
           toast("文件里没有你选中的数据", true);
           return;
         }
-        const replace = available.includes("records") && scopes.includes("records");
+        const replace = available.includes("records") && chosenCats.has("records");
         const question = replace
           ? "导入「学习记录」会用文件里的进度、统计和设置覆盖本机，确定继续吗？"
           : "会把文件里的数据合并到本机，已有的词不会重复添加，确定继续吗？";
@@ -2464,6 +3053,7 @@
     if (typeof settings.softKeyboard !== "boolean") settings.softKeyboard = isTouchDevice();
     settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
     settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
+    settings.personalTargetId = typeof settings.personalTargetId === "string" ? settings.personalTargetId : "";
     return {
       version: 1,
       settings,
@@ -2530,6 +3120,11 @@
 
   async function selectBook(id) {
     if (!state.meta.books.some((book) => book.id === id)) return;
+    const personal = personalBook(id);
+    if (personal && !personal.words.length) {
+      toast(`「${personal.name}」还没有词，先加几个再练`);
+      return;
+    }
     if (store.settings.bookId === id && state.books[id]) {
       closeSheet();
       return;
@@ -3393,11 +3988,10 @@
 
   function mergeUpload(entries, fileName, options = {}) {
     const now = Date.now();
-    const existing = state.upload && Array.isArray(state.upload.words) ? state.upload : null;
+    const target = personalBook(options.bookId) || activePersonalBook();
+    if (!target) throw new Error("还没有词汇本，请先新建一个");
     const byWord = new Map();
-    if (existing) {
-      for (const entry of existing.words) byWord.set(entry.w, { ...entry });
-    }
+    for (const entry of target.words) byWord.set(entry.w, { ...entry });
     let added = 0;
     for (const entry of entries) {
       const previous = byWord.get(entry.w);
@@ -3426,27 +4020,31 @@
       a.w.localeCompare(b.w)
     ));
     const words = all.slice(0, UPLOAD_MAX_WORDS);
-    const files = existing && Array.isArray(existing.files) ? existing.files.slice() : [];
+    const files = Array.isArray(target.files) ? target.files.slice() : [];
     // 手动加入的词没有“试卷”来源，不记到 files 里。
     if (!options.manual && fileName) files.unshift({ name: fileName, at: now, added, matched: entries.length });
-    return {
-      upload: {
-        version: 1,
-        createdAt: (existing && existing.createdAt) || now,
-        updatedAt: now,
-        files: files.slice(0, 20),
-        words,
-      },
-      added,
-      truncated: all.length > UPLOAD_MAX_WORDS,
-    };
+    target.words = words;
+    target.files = files.slice(0, 20);
+    target.updatedAt = now;
+    target.createdAt = target.createdAt || now;
+    return { book: target, added, truncated: all.length > UPLOAD_MAX_WORDS };
   }
 
   /* ---------------- 单词 → 个人词汇 ---------------- */
-  function inPersonalWords(word) {
+  function booksContainingWord(word) {
     const key = String(word || "").toLowerCase();
-    if (!key || !state.upload || !Array.isArray(state.upload.words)) return false;
-    return state.upload.words.some((entry) => entry.w === key);
+    if (!key) return [];
+    return personalBooks().filter((book) => book.words.some((entry) => entry.w === key));
+  }
+
+  function inPersonalWords(word) {
+    return booksContainingWord(word).length > 0;
+  }
+
+  function inBook(bookId, word) {
+    const book = personalBook(bookId);
+    const key = String(word || "").toLowerCase();
+    return Boolean(book && key && book.words.some((entry) => entry.w === key));
   }
 
   // 题目里的词条（可能来自任意词库）转成个人词汇的存法。
@@ -3472,109 +4070,244 @@
     return out;
   }
 
-  // 反馈卡里的那一个按钮：没在个人词汇里就是“加入”，已经在里面就是“移出”。
+  // 反馈卡里的那一个按钮：不在词汇本里就写「加入」，已经在里面就直接写「从词汇本移除」。
   // 注意不要带 data-word：document 上的查词监听会把它当成“点单词查释义”。
   function personalButtonHTML(word) {
     const added = inPersonalWords(word);
     return `<button class="personal-btn${added ? " is-added" : ""}" type="button" data-personal-toggle>${added
-      ? `${ICONS.minus} 从个人词汇中移出`
-      : `${ICONS.plus} 加入个人词汇`}</button>`;
+      ? `${ICONS.close} 从词汇本移除`
+      : `${ICONS.plus} 加入词汇本`}</button>`;
   }
 
   function setPersonalButtonState(button, added) {
     if (!button) return;
     button.classList.toggle("is-added", Boolean(added));
-    button.innerHTML = added ? `${ICONS.minus} 从个人词汇中移出` : `${ICONS.plus} 加入个人词汇`;
+    button.innerHTML = added ? `${ICONS.close} 从词汇本移除` : `${ICONS.plus} 加入词汇本`;
   }
 
-  function addWordToPersonal(entry, button, skipRender = false) {
+  function addWordToPersonal(entry, button, skipRender = false, bookId = "") {
     const item = personalEntryFrom(entry);
     if (!item) return;
-    if (inPersonalWords(item.w)) {
+    let target = personalBook(bookId) || resolvePersonalTarget();
+    if (!target) {
+      try {
+        target = createPersonalBook("个人词汇");
+      } catch (error) {
+        toast(error && error.message ? error.message : "新建词汇本失败", true);
+        return;
+      }
+    }
+    if (inBook(target.id, item.w)) {
       setPersonalButtonState(button, true);
-      toast(`「${item.w}」已经在个人词汇里了`);
+      toast(`「${item.w}」已经在「${target.name}」里了`);
       return;
     }
     try {
-      const result = mergeUpload([item], "", { manual: true });
-      saveUpload(result.upload);
-      state.upload = result.upload;
-      invalidateUploadBook();
-      syncUploadBookMeta();
+      mergeUpload([item], "", { manual: true, bookId: target.id });
+      savePersonal();
+      state.personal.lastUsedId = target.id;
+      store.settings.personalTargetId = target.id;
       // 新词要能进练习范围：范围和词表重排序对不上，直接放开成全部。
-      delete store.settings.ranges[UPLOAD_BOOK_ID];
+      delete store.settings.ranges[target.id];
       saveStore();
+      invalidateUploadBook(target.id);
+      syncUploadBookMeta();
       if (!skipRender) {
-        if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
+        if (store.settings.bookId === target.id) ensureBook(target.id).catch(() => {});
         else if (!ui.session) renderCurrent();
       }
       setPersonalButtonState(button, true);
-      toast(`「${item.w}」已加入个人词汇 · 共 ${uploadStats().total} 词`);
+      toast(`「${item.w}」已加入「${target.name}」 · 共 ${target.words.length} 词`);
     } catch (error) {
       console.warn("Failed to add personal word", error);
-      toast(error && error.message ? error.message : "加入个人词汇失败", true);
+      toast(error && error.message ? error.message : "加入词汇本失败", true);
     }
   }
 
-  function removeWordFromPersonal(word, button, skipRender = false) {
+  function removeWordFromPersonal(word, button, skipRender = false, bookId = "") {
     const key = String(word || "").toLowerCase();
-    const upload = state.upload;
-    if (!key || !upload || !Array.isArray(upload.words)) return;
-    const remaining = upload.words.filter((item) => item.w !== key);
-    if (remaining.length === upload.words.length) {
+    const target = personalBook(bookId) || resolvePersonalTarget();
+    if (!key || !target) return;
+    const remaining = target.words.filter((item) => item.w !== key);
+    if (remaining.length === target.words.length) {
       setPersonalButtonState(button, false);
       return;
     }
-    const progress = store.progress[UPLOAD_BOOK_ID];
+    const progress = store.progress[target.id];
     if (progress) delete progress[key];
 
-    if (!remaining.length) {
-      // 最后一个词被移出：整个个人词汇一起清掉，回到高考词库
-      try {
-        localStorage.removeItem(UPLOAD_KEY);
-      } catch (error) {
-        console.warn(error);
-      }
-      state.upload = null;
-      invalidateUploadBook();
-      delete store.progress[UPLOAD_BOOK_ID];
-      delete store.settings.ranges[UPLOAD_BOOK_ID];
-      for (const day of Object.values(store.daily)) {
-        if (day && day.newByBook) delete day.newByBook[UPLOAD_BOOK_ID];
-      }
-      if (store.settings.bookId === UPLOAD_BOOK_ID) store.settings.bookId = "gaokao";
-      saveStore();
-      syncUploadBookMeta();
-      setPersonalButtonState(button, false);
-      if (!skipRender) ensureCurrentBook().catch(() => {});
-      toast(`「${key}」已移出，个人词汇已清空`);
-      return;
-    }
-
-    upload.words = remaining;
-    upload.updatedAt = Date.now();
+    target.words = remaining;
+    target.updatedAt = Date.now();
     try {
-      saveUpload(upload);
+      savePersonal();
     } catch (error) {
       toast(error && error.message ? error.message : "保存失败", true);
       return;
     }
-    invalidateUploadBook();
+    invalidateUploadBook(target.id);
     syncUploadBookMeta();
+    // 变空的那一本不再自动删除（可能是用户自己命名的），但当前正在练它就先退回高考。
+    if (!remaining.length && store.settings.bookId === target.id) {
+      store.settings.bookId = "gaokao";
+    }
     saveStore();
     if (!skipRender) {
-      if (store.settings.bookId === UPLOAD_BOOK_ID) ensureBook(UPLOAD_BOOK_ID).catch(() => {});
+      if (store.settings.bookId === target.id) ensureBook(target.id).catch(() => {});
       else if (!ui.session) renderCurrent();
     }
-    setPersonalButtonState(button, false);
-    toast(`「${key}」已从个人词汇移出 · 还剩 ${remaining.length} 词`);
+    setPersonalButtonState(button, inPersonalWords(key));
+    toast(`「${key}」已从「${target.name}」移出 · 还剩 ${remaining.length} 词`);
   }
 
   function togglePersonalWord(entry, button) {
     const word = String((entry && entry.w) || "").toLowerCase();
     if (!word) return;
-    if (inPersonalWords(word)) removeWordFromPersonal(word, button);
-    else addWordToPersonal(entry, button);
+    const books = personalBooks();
+    // 有多个词汇本时先让用户选加到哪一本（也可以新建）。
+    if (books.length > 1) {
+      openAddToBookSheet(entry);
+      return;
+    }
+    if (!books.length) {
+      addWordToPersonal(entry, button);
+      return;
+    }
+    if (inBook(books[0].id, word)) removeWordFromPersonal(word, button, false, books[0].id);
+    else addWordToPersonal(entry, button, false, books[0].id);
+  }
+
+  // 多个词汇本时，答题/查词处的「加入词汇本」先问加到哪一本，也能就地新建。
+  // 已经在某一本里的，那一行直接显示「移除」。
+  function openAddToBookSheet(entry) {
+    const item = personalEntryFrom(entry);
+    if (!item) return;
+    ui.addBookWord = item;
+    const rows = personalBooks().map((book) => {
+      const added = inBook(book.id, item.w);
+      return `
+        <button class="book-row ${added ? "is-added" : ""}" type="button" data-add-to-book="${escAttr(book.id)}">
+          <span class="book-row-main">
+            <strong>${esc(book.name)}</strong>
+            <small>${book.words.length} 词${added ? " · 已在这本里" : ""}</small>
+          </span>
+          <span class="book-row-state">${added ? `${ICONS.close} 移除` : `${ICONS.plus} 加入`}</span>
+        </button>`;
+    }).join("");
+    openSheet(`
+      ${sheetHead("加入词汇本", `${item.w} · ${shortMeaning(item.m) || "暂无释义"}`)}
+      <div class="add-book-list">
+        ${rows || `<div class="word-search-empty">还没有词汇本，在下面新建一个就能直接加进来。</div>`}
+      </div>
+      <form class="book-create-form" data-add-book-form>
+        <input class="word-search-input" type="text" maxlength="${PERSONAL_NAME_MAX}"
+          autocapitalize="none" autocomplete="off" placeholder="新建词汇本，例如：作文常用"
+          aria-label="新建词汇本名称" data-add-book-name>
+        <button class="soft-btn" type="submit">新建并加入</button>
+      </form>
+      <div class="sheet-note">显示「加入」的点一下加进这一本，显示「移除」的点一下从这一本拿掉。</div>
+    `, { focus: false });
+  }
+
+  function handleAddToBook(bookId) {
+    const item = ui.addBookWord;
+    if (!item) return;
+    if (inBook(bookId, item.w)) removeWordFromPersonal(item.w, null, false, bookId);
+    else addWordToPersonal(item, null, false, bookId);
+    const button = $("[data-personal-toggle]");
+    if (button) setPersonalButtonState(button, inPersonalWords(item.w));
+    openAddToBookSheet(item);
+  }
+
+  function handleAddToNewBook(name) {
+    const item = ui.addBookWord;
+    let book = null;
+    try {
+      book = createPersonalBook(name);
+    } catch (error) {
+      toast(error && error.message ? error.message : "新建失败", true);
+      return;
+    }
+    if (item) addWordToPersonal(item, null, false, book.id);
+    toast(`已新建「${book.name}」`);
+    if (item) openAddToBookSheet(item);
+    else closeSheet();
+  }
+
+  // 「加到哪一本」的 chips：手动检录和导入选择页共用。
+  function bookChipsHTML(activeId, scope) {
+    const books = personalBooks();
+    const active = books.some((book) => book.id === activeId) ? activeId : (books[0] ? books[0].id : "");
+    const chips = books.map((book) => `
+      <button class="target-chip ${book.id === active ? "is-active" : ""}" type="button"
+        data-target-book="${escAttr(book.id)}" data-target-scope="${escAttr(scope)}">
+        ${esc(book.name)}<i>${book.words.length}</i>
+      </button>`).join("");
+    return `
+      <div class="target-chips" data-target-row="${escAttr(scope)}">
+        <span class="target-label">${books.length ? "加入" : "还没有词汇本"}</span>
+        ${chips}
+        <button class="target-chip is-new" type="button" data-new-book="${escAttr(scope)}">${ICONS.plus} 新建</button>
+      </div>`;
+  }
+
+  function personalTargetForScope(scope) {
+    return scope === "upload" ? ui.uploadTargetId : ui.manualTargetId;
+  }
+
+  function setPersonalTargetForScope(scope, bookId) {
+    if (scope === "upload") ui.uploadTargetId = bookId;
+    else ui.manualTargetId = bookId;
+    setPersonalTarget(bookId);
+    const row = $(`[data-target-row="${scope}"]`);
+    if (row) row.outerHTML = bookChipsHTML(bookId, scope);
+  }
+
+  function openNewBookSheet(scope) {
+    openSheet(`
+      ${sheetHead("新建词汇本", "自己取个名字，比如：作文常用 / 阅读生词")}
+      <form class="book-create-form" data-new-book-form data-scope="${escAttr(scope)}">
+        <input class="word-search-input" type="text" maxlength="${PERSONAL_NAME_MAX}"
+          autocapitalize="none" autocomplete="off" placeholder="词汇本名称" aria-label="词汇本名称" data-new-book-name>
+        <button class="soft-btn" type="submit">创建</button>
+      </form>
+      <div class="sheet-note">建好后会自动切到这一本；以后手动加词、导入、听写加词都可以选它。</div>
+    `);
+    const input = $("#sheetContent [data-new-book-name]");
+    if (input) window.setTimeout(() => input.focus(), 120);
+  }
+
+  function handleNewBookForm(form) {
+    const scope = form.dataset.scope || "manual";
+    const input = $("[data-new-book-name]", form);
+    let book = null;
+    try {
+      book = createPersonalBook(input ? input.value : "");
+    } catch (error) {
+      toast(error && error.message ? error.message : "新建失败", true);
+      return;
+    }
+    setPersonalTarget(book.id);
+    if (scope === "upload") {
+      // closeSheet 会清掉 ui.uploadDraft，先把选择状态抓在手里，等弹层关掉再恢复。
+      const draft = ui.uploadDraft;
+      ui.uploadTargetId = book.id;
+      closeSheet();
+      resumeUploadSelection(draft);
+    } else if (scope === "lookup") {
+      // 查词页新建：建完就把这个词加进去，再回到这个词的查词页。
+      const item = ui.addBookWord;
+      ui.addBookWord = null;
+      const word = item ? item.w : "";
+      if (item) addWordToPersonal(item, null, true, book.id);
+      closeSheet();
+      if (word) openWordSheet(word);
+      else renderCurrent();
+    } else {
+      ui.manualTargetId = book.id;
+      closeSheet();
+      renderHome();
+    }
+    toast(`已新建「${book.name}」`);
   }
 
   async function handleUploadFile(file) {
@@ -3654,30 +4387,46 @@
       </div>`).join("");
   }
 
-  function showUploadSelection(entries, fileName) {
-    const existing = new Set(((state.upload && state.upload.words) || []).map((entry) => entry.w));
+  function showUploadSelection(entries, fileName, keepSelected = null) {
+    const target = resolvePersonalTarget(ui.uploadTargetId);
+    ui.uploadTargetId = target ? target.id : "";
+    const existing = new Set(((target && target.words) || []).map((entry) => entry.w));
     for (const entry of entries) entry.existing = existing.has(entry.w);
-    const selected = new Set(entries.map((entry) => entry.w));
+    const selected = keepSelected instanceof Set && keepSelected.size
+      ? new Set(entries.filter((entry) => keepSelected.has(entry.w)).map((entry) => entry.w))
+      : new Set(entries.map((entry) => entry.w));
     ui.uploadDraft = { entries, fileName, selected, anchorIndex: null };
     const count = entries.length;
     openSheet(`
       ${sheetHead("选择要加入的词", `${fileName} · 识别到 ${count} 词`)}
+      ${bookChipsHTML(ui.uploadTargetId, "upload")}
       <div class="upload-pick-bar">
-        <span class="upload-pick-count" id="uploadPickCount"><strong>${count}</strong> / ${count} 词</span>
+        <span class="upload-pick-count" id="uploadPickCount"><strong>${selected.size}</strong> / ${count} 词</span>
         <span class="upload-pick-tools">
           <button class="mini-btn" type="button" data-upload-all>全选</button>
           <button class="mini-btn" type="button" data-upload-none>全不选</button>
         </span>
       </div>
-      <div class="sheet-note">取消勾选不想加入的词。Shift 连选；按住拖动可批量勾选。例句使用试卷原句。</div>
+      <div class="sheet-note">先选加到哪一本（可新建），再取消勾选不想加入的词。Shift 连选；按住拖动可批量勾选。</div>
       <div class="upload-pick-actions">
-        <button class="primary-btn" type="button" data-upload-confirm>加入 ${count} 词</button>
+        <button class="primary-btn" type="button" data-upload-confirm>加入 ${selected.size} 词</button>
         <button class="ghost-btn" type="button" data-pick-upload>换一个文件</button>
       </div>
       <div class="upload-pick-scroll">
         ${uploadPickSectionsHTML(entries, selected)}
       </div>
     `, { maximized: true, focus: false });
+    updateUploadPickCount();
+  }
+
+  // 新建词汇本后重新打开选择页，保留刚才勾选的词。
+  function resumeUploadSelection(draft = ui.uploadDraft) {
+    if (!draft) {
+      renderHome();
+      return;
+    }
+    const entries = draft.entries.map(({ existing, ...entry }) => entry);
+    showUploadSelection(entries, draft.fileName, draft.selected);
   }
 
   // 学习范围里点「个人词汇」卡片：列出已加入的词，勾选要删的那几个。
@@ -3699,52 +4448,31 @@
 
   function deleteSelectedUploadWords() {
     const draft = ui.uploadDraft;
-    const upload = state.upload;
+    const upload = personalBook(ui.manageBookId) || activePersonalBook();
     if (!draft || draft.mode !== "delete" || !upload || !draft.selected.size) return;
     const remove = draft.selected;
     const remaining = upload.words.filter((entry) => !remove.has(entry.w));
     const removed = upload.words.length - remaining.length;
-    const progress = store.progress[UPLOAD_BOOK_ID];
+    const progress = store.progress[upload.id];
     if (progress) for (const word of remove) delete progress[word];
     closeSheet();
-
-    if (!remaining.length) {
-      // 全删完了：整个个人词汇一起清掉，回到高考词库
-      try {
-        localStorage.removeItem(UPLOAD_KEY);
-      } catch (error) {
-        console.warn(error);
-      }
-      state.upload = null;
-      invalidateUploadBook();
-      delete store.progress[UPLOAD_BOOK_ID];
-      delete store.settings.ranges[UPLOAD_BOOK_ID];
-      for (const day of Object.values(store.daily)) {
-        if (day && day.newByBook) delete day.newByBook[UPLOAD_BOOK_ID];
-      }
-      if (store.settings.bookId === UPLOAD_BOOK_ID) store.settings.bookId = "gaokao";
-      saveStore();
-      syncUploadBookMeta();
-      renderCurrent();
-      ensureCurrentBook().catch(() => {});
-      toast(`已删除 ${removed} 个词，个人词汇已清空`);
-      return;
-    }
 
     upload.words = remaining;
     upload.updatedAt = Date.now();
     try {
-      saveUpload(upload);
+      savePersonal();
     } catch (error) {
       toast(error && error.message ? error.message : "保存失败", true);
       return;
     }
-    invalidateUploadBook();
+    invalidateUploadBook(upload.id);
+    // 删空了就把当前词库退回高考，但保留这个词汇本本身（可以继续加词或改名）。
+    if (!remaining.length && store.settings.bookId === upload.id) store.settings.bookId = "gaokao";
     syncUploadBookMeta();
     saveStore();
     renderCurrent();
     ensureCurrentBook().catch(() => {});
-    toast(`已删除 ${removed} 个词`);
+    toast(remaining.length ? `已删除 ${removed} 个词` : `已删除 ${removed} 个词，「${upload.name}」空了`);
   }
 
   function updateUploadPickCount() {
@@ -3957,21 +4685,24 @@
     }
     ui.uploadBusy = true;
     try {
-      const result = mergeUpload(entries, draft.fileName);
-      saveUpload(result.upload);
-      state.upload = result.upload;
-      invalidateUploadBook();
+      let target = resolvePersonalTarget(ui.uploadTargetId);
+      if (!target) target = createPersonalBook("个人词汇");
+      const result = mergeUpload(entries, draft.fileName, { bookId: target.id });
+      savePersonal();
+      setPersonalTarget(target.id);
+      ui.uploadTargetId = target.id;
+      invalidateUploadBook(target.id);
       syncUploadBookMeta();
-      store.settings.bookId = UPLOAD_BOOK_ID;
-      delete store.settings.ranges[UPLOAD_BOOK_ID];
+      store.settings.bookId = target.id;
+      delete store.settings.ranges[target.id];
       saveStore();
       ui.uploadDraft = null;
-      await ensureBook(UPLOAD_BOOK_ID);
+      await ensureBook(target.id);
       renderCurrent();
-      showUploadResult(result.upload, result.added, draft.fileName, result.truncated, entries.length);
+      showUploadResult(target, result.added, draft.fileName, result.truncated, entries.length);
     } catch (error) {
       console.warn("Upload save failed", error);
-      toast(error && error.message ? error.message : "保存个人词汇失败", true);
+      toast(error && error.message ? error.message : "保存词汇本失败", true);
     } finally {
       ui.uploadBusy = false;
     }
@@ -4021,10 +4752,10 @@
       ${sheetHead("提取完成", subtitle)}
       ${uploadSummaryHTML(stats)}
       <div class="upload-actions">
-        <button class="primary-btn" type="button" data-upload-practice>用个人词汇练习</button>
+        <button class="primary-btn" type="button" data-upload-practice>用这个词汇本练习</button>
         <button class="ghost-btn" type="button" data-pick-upload>继续上传</button>
       </div>
-      <div class="sheet-note">已加入学习范围最前面的「个人词汇」。题目右上角显示词汇类别；同一词同时属于多个词库时，只显示最基础的归属。</div>
+      <div class="sheet-note">已加入「${esc(upload.name)}」，学习范围第二行就能看到它。题目右上角显示词汇类别；同一词同时属于多个词库时，只显示最基础的归属。</div>
       ${truncated ? `<div class="sheet-note">词汇超过 ${UPLOAD_MAX_WORDS} 个，只保留前 ${UPLOAD_MAX_WORDS} 个。</div>` : ""}
       ${uploadSectionsHTML(upload)}
     `);
@@ -4069,57 +4800,118 @@
     `, { maximized: true, focus: false });
   }
 
-  function openUploadManageSheet() {
-    if (!state.upload || !state.upload.words.length) {
+  // 管理页顶部：多本时可以直接切到另一本去管理，不用退回去点卡片。
+  function manageBookChipsHTML(activeId) {
+    const books = personalBooks();
+    if (books.length < 2) return "";
+    const chips = books.map((book) => `
+      <button class="target-chip ${book.id === activeId ? "is-active" : ""}" type="button" data-manage-book="${escAttr(book.id)}">
+        ${esc(book.name)}<i>${book.words.length}</i>
+      </button>`).join("");
+    return `<div class="target-chips"><span class="target-label">管理</span>${chips}</div>`;
+  }
+
+  function openUploadManageSheet(bookId = "") {
+    // 明确指定了某一本就必须管理那一本，找不到时不要悄悄换成别的本。
+    const wanted = personalBook(bookId);
+    if (!wanted && bookId) {
+      toast("这个词汇本已经不在了", true);
+      renderCurrent();
+      return;
+    }
+    const book = wanted || activePersonalBook();
+    if (!book) {
       openSheet(`
-        ${sheetHead("个人词汇", "还没有收过词")}
+        ${sheetHead("个人词汇", "还没有词汇本")}
         <div class="empty-state" style="padding:22px 12px 16px">
           <div class="empty-icon">${ICONS.upload}</div>
-          <h3>两种加法</h3>
-          <p>答题后点「加入个人词汇」，一个词一个词攒；或者上传一份试卷，批量提取后勾选要加入的词。</p>
-          <button class="primary-btn" type="button" data-pick-upload>上传试卷</button>
+          <h3>先建一个词汇本</h3>
+          <p>可以自己命名，比如「作文常用」「阅读生词」；也可以上传试卷，提取后选一本加进去。</p>
+          <button class="primary-btn" type="button" data-new-personal-book>新建词汇本</button>
+          <button class="ghost-btn" type="button" data-pick-upload>上传试卷</button>
         </div>
       `);
       return;
     }
-    const stats = uploadStats();
-    const files = (state.upload.files || []).length;
-    const words = state.upload.words;
-    const subtitle = files ? `${stats.total} 词 · 来自 ${files} 份试卷` : `${stats.total} 词 · 答题时逐个加入`;
+    ui.manageBookId = book.id;
+    const stats = uploadStats(book);
+    const files = (book.files || []).length;
+    const words = book.words;
+    const subtitle = words.length
+      ? (files ? `${stats.total} 词 · 来自 ${files} 份试卷` : `${stats.total} 词 · 手动/答题时加入`)
+      : "这一本还是空的";
     // 这个弹层同时是「管理」：勾选词条就能删掉不想要的词。
     ui.uploadDraft = { mode: "delete", entries: words, selected: new Set(), anchorIndex: null };
     openSheet(`
-      ${sheetHead("个人词汇", subtitle)}
-      ${wordSearchHTML({ mode: "manage", placeholder: "输入英文词，下拉显示已收录词汇", button: "搜索" })}
+      ${sheetHeadEditable(book.name, subtitle, `<button class="title-edit" type="button" data-rename-book aria-label="修改词汇本名称">${ICONS.pencil}</button>`)}
+      ${manageBookChipsHTML(book.id)}
+      ${wordSearchHTML({ mode: "manage", bookId: book.id, placeholder: "输入英文词，下拉显示这一本的词", button: "搜索" })}
       ${uploadSummaryHTML(stats)}
       <div class="upload-actions">
         <button class="primary-btn" type="button" data-upload-practice>开始练习</button>
         <button class="ghost-btn" type="button" data-pick-upload>继续上传</button>
-        <button class="mini-btn danger" type="button" data-upload-clear>清空</button>
       </div>
-      <div class="upload-pick-bar">
-        <span class="upload-pick-count" id="uploadPickCount"><strong>0</strong> / ${words.length} 词</span>
-        <span class="upload-pick-tools">
-          <button class="mini-btn" type="button" data-upload-all>全选</button>
-          <button class="mini-btn" type="button" data-upload-none>全不选</button>
-          <button class="mini-btn danger" type="button" data-upload-delete disabled>删除选中</button>
-        </span>
+      <div class="book-manage-tools">
+        <button class="mini-btn" type="button" data-rename-book>重命名</button>
+        <button class="mini-btn danger" type="button" data-delete-book>删除这本</button>
+        <button class="mini-btn danger" type="button" data-upload-clear>清空词汇</button>
       </div>
-      <div class="sheet-note">勾选要删除的词，再点「删除选中」。Shift 连选；按住拖动可批量勾选。</div>
-      <div class="upload-pick-scroll is-delete-mode">
-        ${uploadManageSectionsHTML(words)}
-      </div>
+      ${words.length ? `
+        <div class="upload-pick-bar">
+          <span class="upload-pick-count" id="uploadPickCount"><strong>0</strong> / ${words.length} 词</span>
+          <span class="upload-pick-tools">
+            <button class="mini-btn" type="button" data-upload-all>全选</button>
+            <button class="mini-btn" type="button" data-upload-none>全不选</button>
+            <button class="mini-btn danger" type="button" data-upload-delete disabled>删除选中</button>
+          </span>
+        </div>
+        <div class="sheet-note">勾选要删除的词，再点「删除选中」。Shift 连选；按住拖动可批量勾选。</div>
+        <div class="upload-pick-scroll is-delete-mode">
+          ${uploadManageSectionsHTML(words)}
+        </div>` : `
+        <div class="sheet-note">用上面的搜索框能把词加进来，或者点「继续上传」导入试卷。</div>`}
     `, { maximized: true, focus: false });
     updateUploadPickCount();
   }
 
+  function openRenameBookSheet(bookId = ui.manageBookId) {
+    const book = personalBook(bookId);
+    if (!book) return;
+    openSheet(`
+      ${sheetHead("重命名词汇本", `${book.words.length} 词`)}
+      <form class="book-create-form" data-rename-book-form data-book-id="${escAttr(book.id)}">
+        <input class="word-search-input" type="text" maxlength="${PERSONAL_NAME_MAX}" value="${escAttr(book.name)}"
+          autocomplete="off" aria-label="词汇本名称" data-rename-book-name>
+        <button class="soft-btn" type="submit">保存</button>
+      </form>
+      <div class="sheet-note">只改名字，里面的词和练习进度都不变。</div>
+    `);
+    const input = $("#sheetContent [data-rename-book-name]");
+    if (input) window.setTimeout(() => { input.focus(); input.select(); }, 120);
+  }
+
+  function handleRenameBookForm(form) {
+    const bookId = form.dataset.bookId;
+    const input = $("[data-rename-book-name]", form);
+    try {
+      const book = renamePersonalBook(bookId, input ? input.value : "");
+      saveStore();
+      renderCurrent();
+      toast(`已改名为「${book.name}」`);
+      openUploadManageSheet(book.id);
+    } catch (error) {
+      toast(error && error.message ? error.message : "改名失败", true);
+    }
+  }
+
   async function activateUploadBook() {
-    if (!state.upload || !state.upload.words.length) {
-      toast("个人词汇还是空的");
+    const book = personalBook(ui.manageBookId) || activePersonalBook();
+    if (!book || !book.words.length) {
+      toast("这个词汇本还是空的");
       return;
     }
     syncUploadBookMeta();
-    store.settings.bookId = UPLOAD_BOOK_ID;
+    store.settings.bookId = book.id;
     saveStore();
     closeSheet();
     renderCurrent();
@@ -4136,31 +4928,79 @@
     }
   }
 
-  function clearUpload() {
-    if (!state.upload) return;
-    if (!confirm("确定清空个人词汇吗？这些词和「个人词汇」的练习进度都会删除。")) return;
+  function clearUpload(bookId = ui.manageBookId) {
+    const book = personalBook(bookId) || activePersonalBook();
+    if (!book || !book.words.length) return;
+    if (!confirm(`确定清空「${book.name}」吗？里面的词和这一本的练习进度都会删除，词汇本本身会保留。`)) return;
+    book.words = [];
+    book.updatedAt = Date.now();
     try {
-      localStorage.removeItem(UPLOAD_KEY);
+      savePersonal();
     } catch (error) {
-      console.warn(error);
+      toast(error && error.message ? error.message : "保存失败", true);
+      return;
     }
-    state.upload = null;
-    invalidateUploadBook();
-    delete store.progress[UPLOAD_BOOK_ID];
-    delete store.settings.ranges[UPLOAD_BOOK_ID];
+    invalidateUploadBook(book.id);
+    delete store.progress[book.id];
+    delete store.settings.ranges[book.id];
     for (const day of Object.values(store.daily)) {
-      if (day && day.newByBook) delete day.newByBook[UPLOAD_BOOK_ID];
+      if (day && day.newByBook) delete day.newByBook[book.id];
     }
-    if (store.settings.bookId === UPLOAD_BOOK_ID) store.settings.bookId = "gaokao";
+    if (store.settings.bookId === book.id) store.settings.bookId = "gaokao";
     saveStore();
     syncUploadBookMeta();
     closeSheet();
     renderCurrent();
     ensureCurrentBook().catch(() => {});
-    toast("已清空个人词汇");
+    toast(`已清空「${book.name}」`);
   }
 
   /* ---------------- lookup ---------------- */
+  // 查词页的「加入词汇本」：不占一整行的大按钮，直接把各本列出来点一下就加。
+  function lookupBookPicksHTML(word) {
+    const books = personalBooks();
+    const chips = books.map((book) => {
+      const added = inBook(book.id, word);
+      return `
+        <button class="book-pick ${added ? "is-added" : ""}" type="button" data-lookup-book="${escAttr(book.id)}">
+          <span class="book-pick-name">${esc(book.name)}</span>
+          <small>${book.words.length}</small>
+          <i class="book-pick-mark">${added ? "移除" : "加入"}</i>
+        </button>`;
+    }).join("");
+    return `
+      <div class="lookup-personal" data-lookup-personal>
+        <div class="lookup-personal-head">
+          <strong>加入词汇本</strong>
+          <small>${books.length ? "在里面的显示「移除」，不在的显示「加入」" : "还没有词汇本，先建一本"}</small>
+        </div>
+        <div class="book-picks">
+          ${chips}
+          <button class="book-pick is-new" type="button" data-lookup-new-book>${ICONS.plus}<span class="book-pick-name">新建</span></button>
+        </div>
+      </div>`;
+  }
+
+  function handleLookupBookPick(bookId) {
+    const word = String((ui.currentLookup && ui.currentLookup.base) || "").toLowerCase();
+    if (!word) return;
+    const lookup = ui.currentLookup || {};
+    const entry = lookup.entry || { w: word, p: lookup.phonetic || "", m: lookup.meaning || "" };
+    if (inBook(bookId, word)) {
+      removeWordFromPersonal(word, null, true, bookId);
+      const book = personalBook(bookId);
+      if (book) toast(`已从「${book.name}」移出`);
+    } else {
+      addWordToPersonal(entry, null, true, bookId);
+      const book = personalBook(bookId);
+      if (book) toast(`已加入「${book.name}」`);
+    }
+    const box = $("[data-lookup-personal]");
+    if (box) box.outerHTML = lookupBookPicksHTML(word);
+    const toggle = $("[data-personal-toggle]");
+    if (toggle) setPersonalButtonState(toggle, inPersonalWords(word));
+  }
+
   async function openWordSheet(raw) {
     const query = String(raw || "").toLowerCase().replace(/^[^a-z]+|[^a-z]+$/g, "");
     if (!query) return;
@@ -4244,8 +5084,8 @@
           <div class="example-en">${example.paper ? renderPaperExample(example.e) : renderTappable(example.e)}</div>
           ${example.t ? `<div class="example-zh">${esc(example.t)}</div>` : ""}
         </div>` : ""}
+      ${lookupBookPicksHTML(result.base)}
       <div class="lookup-actions lookup-actions-stack">
-        <button class="ghost-btn personal-toggle ${inPersonalWords(result.base) ? " is-added" : ""}" type="button" data-personal-word="${escAttr(result.base)}">${inPersonalWords(result.base) ? `${ICONS.minus} 从个人词汇中移出` : `${ICONS.plus} 加入个人词汇`}</button>
         ${inCurrentBook
           ? `<button class="primary-btn" type="button" data-mark-word="${escAttr(found.entry.w)}" ${alreadyWrong ? "disabled" : ""}>${alreadyWrong ? "已在错词本" : "加入错词本"}</button>`
           : `<button class="primary-btn" type="button" data-close-sheet>知道了</button>`}
@@ -4290,10 +5130,13 @@
     closeSheet();
   }
 
-  function removeWrongWord(word) {
-    const book = currentBook();
-    if (!book) return;
-    const progress = progressFor(book.id);
+  function removeWrongWord(key) {
+    const raw = String(key || "");
+    const cut = raw.indexOf("|");
+    const bookId = cut > 0 ? raw.slice(0, cut) : (currentBook() || {}).id;
+    const word = cut > 0 ? raw.slice(cut + 1) : raw;
+    if (!bookId || !word) return;
+    const progress = progressFor(bookId);
     const item = progress[word];
     if (!item) return;
     item.mastered = true;
@@ -4958,25 +5801,39 @@
   }
 
   /* ---------------- session ---------------- */
-  function buildDailyQueue(book) {
+  // 一次练习拆成三轮：一轮新词、一轮错词重写、一轮复习。每轮开头给一条提示，不混在一起。
+  const ROUND_META = {
+    new: { title: "新词练习", hint: "先把今天的新词过一遍" },
+    wrong: { title: "错词重写", hint: "刚才写错的词，再写一遍" },
+    review: { title: "复习", hint: "到期的旧词，看看还记得多少" },
+    free: { title: "自由练习", hint: "从学过的词里随便抽一组" },
+    single: { title: "练习", hint: "" },
+  };
+
+  // 三轮练习里同一个词不在同一轮插队重写：写错的词统一进第 2 轮，保证「一轮练习、一轮错词、一轮复习」
+  // 的题号是干净的（5 个新词错 3 个，第 6 题就是错词、第 9 题就是复习）。自由练习/单轮练习仍保留插队。
+  const ROUND_RETRY_LIMIT = { new: 0, wrong: 0, review: 0, free: 2, single: 2 };
+
+  // dailyPlan：把今天的任务拆成「新词」和「复习」两批，错词那一轮等练完再生成。
+  // bypassQuota：今天的额度用完了还要继续练时，再给一批新词，不再卡在额度上。
+  function dailyPlan(book, bypassQuota = false) {
     const progress = progressFor(book.id);
     const words = rangeWords(book);
-    const unseen = [];
-    for (const entry of words) {
-      if (!progress[entry.w]) unseen.push(entry);
-    }
-    const dueEntries = dueWords(book)
-      .slice(0, store.settings.dailyReview)
+    const unseen = words.filter((entry) => !progress[entry.w]);
+    const due = dueWords(book)
+      .slice(0, Math.max(0, store.settings.dailyReview))
       .map(({ entry }) => entry);
-    const newLimit = Math.max(0, store.settings.dailyNew - todayNew(book.id));
+    const newLimit = bypassQuota
+      ? Math.max(10, store.settings.dailyNew)
+      : Math.max(0, store.settings.dailyNew - todayNew(book.id));
     const randomOrder = store.settings.order === "random";
     const freshGroups = randomOrder
       ? selectRelatedGroups(unseen, newLimit, book)
       : unseen.slice(0, newLimit).map((entry) => [entry]);
-    const dueGroups = randomOrder
-      ? selectRelatedGroups(dueEntries, dueEntries.length, book)
-      : dueEntries.map((entry) => [entry]);
-    return weaveGroups(freshGroups, dueGroups);
+    return {
+      fresh: freshGroups.reduce((out, group) => out.concat(group), []),
+      review: randomOrder ? arrangeRelated(due, book) : due,
+    };
   }
 
   function pickFreeQueue(book) {
@@ -5014,29 +5871,80 @@
     if (!book) return;
     if (mode !== "zh2en" && mode !== "en2zh") mode = "zh2en";
 
-    let queue = [];
-    if (Array.isArray(options.entries) && options.entries.length) {
-      queue = arrangeRelated(options.entries, book).map((entry) => ({ word: entry, isNew: false }));
+    let rounds = [];
+    if (Array.isArray(options.items) && options.items.length) {
+      // 跨词库练习（例如「所有错词」）：每条自带所属词库，进度写回各自那一本。
+      rounds = [{
+        key: "single",
+        items: options.items.map(({ entry, bookId }) => ({ word: entry, isNew: false, bookId: bookId || book.id })),
+      }];
+    } else if (Array.isArray(options.entries) && options.entries.length) {
+      rounds = [{
+        key: "single",
+        items: arrangeRelated(options.entries, book).map((entry) => ({ word: entry, isNew: false })),
+      }];
     } else if (options.source === "wrong") {
       const entries = wrongEntries(book).slice(0, 30).map(({ entry }) => entry);
-      queue = arrangeRelated(entries, book).map((entry) => ({ word: entry, isNew: false }));
+      rounds = [{ key: "single", items: arrangeRelated(entries, book).map((entry) => ({ word: entry, isNew: false })) }];
     } else if (options.source === "free") {
-      queue = pickFreeQueue(book);
+      rounds = [{ key: "free", items: pickFreeQueue(book) }];
     } else {
-      queue = buildDailyQueue(book);
-      if (!queue.length) queue = pickFreeQueue(book);
+      // 每天的主流程：第 1 轮新词、第 2 轮错词（练完才生成）、第 3 轮复习。
+      let plan = dailyPlan(book);
+      if (!plan.fresh.length) {
+        // 今日新词额度用完后再点「开始练习」，就继续往下加练，不把人挡在外面。
+        const extra = dailyPlan(book, true);
+        if (extra.fresh.length) {
+          plan = extra;
+          toast("今日新词额度已满，这一轮继续加练新词");
+        }
+      }
+      if (plan.fresh.length) {
+        rounds.push({ key: "new", items: plan.fresh.map((entry) => ({ word: entry, isNew: true })) });
+      }
+      // 复习量设成 0 就是「今天不复习」，连这一轮都不出现，两轮练完直接收工。
+      if (plan.review.length) {
+        rounds.push({ key: "review", items: plan.review.map((entry) => ({ word: entry, isNew: false })) });
+      }
+      if (!rounds.length && store.settings.dailyReview > 0) {
+        const free = pickFreeQueue(book);
+        if (free.length) rounds.push({ key: "free", items: free });
+      }
+      if (!rounds.length) {
+        toast(store.settings.dailyReview === 0
+          ? "这一范围的新词都练过了；复习数量设成 0，去设置里调大就能复习旧词"
+          : "当前范围还没有可练习的单词");
+        return;
+      }
     }
 
-    if (!queue.length) {
+    if (!rounds.length || !rounds[0].items.length) {
       toast("当前范围还没有可练习的单词");
       return;
+    }
+
+    // 跨词汇本练习时标题不能写成当前词库，按队列实际来源标一下。
+    const allQueued = rounds.reduce((out, round) => out.concat(round.items), []);
+    const queueBookIds = new Set(allQueued.map((item) => item.bookId).filter(Boolean));
+    let sessionLabel = book.name;
+    if (queueBookIds.size === 1) {
+      const only = bookById([...queueBookIds][0]);
+      if (only) sessionLabel = only.name;
+    } else if (queueBookIds.size > 1) {
+      sessionLabel = "跨词汇本";
     }
 
     ui.session = {
       mode,
       bookId: book.id,
-      queue,
+      label: sessionLabel,
+      rounds,
+      roundIndex: 0,
+      queue: rounds[0].items,
       index: 0,
+      done: 0,
+      showRoundNotice: true,
+      wrongRoundReady: false,
       attempts: 0,
       correct: 0,
       score: 0,
@@ -5057,15 +5965,57 @@
     renderSession(true);
   }
 
+  // 三轮里所有题目摊平，进度条和「6 / 28」都按总数算。
+  function sessionItems(session) {
+    if (!session) return [];
+    if (!session.rounds) return session.queue || [];
+    return session.rounds.reduce((out, round) => out.concat(round.items), []);
+  }
+
+  function currentRound(session) {
+    if (!session || !session.rounds) return null;
+    return session.rounds[session.roundIndex] || null;
+  }
+
+  function currentRoundKey(session) {
+    const round = currentRound(session);
+    return round ? round.key : "single";
+  }
+
+  function roundNumberFor(session, round) {
+    if (!session || !session.rounds) return 1;
+    const filled = session.rounds.filter((item) => item.items.length);
+    const position = filled.indexOf(round);
+    return position >= 0 ? position + 1 : 1;
+  }
+
+  function sessionRoundLabel(session) {
+    const round = currentRound(session);
+    if (!round || round.key === "single" || round.key === "free") return "";
+    return `第 ${roundNumberFor(session, round)} 轮`;
+  }
+
   function updateSessionHeader() {
     const session = ui.session;
     if (!session) return;
     const book = bookById(session.bookId);
-    $("#sessionBook").textContent = `${book ? book.name : "练习"} · ${MODE_LABEL[session.mode]}`;
-    $("#sessionCount").textContent = `${Math.min(session.index + 1, session.queue.length)} / ${session.queue.length}`;
+    const label = session.label || (book ? book.name : "练习");
+    $("#sessionBook").textContent = `${label} · ${MODE_LABEL[session.mode]}`;
+
+    const total = Math.max(1, sessionItems(session).length);
+    const done = session.done || 0;
+    const current = clamp(done + (session.answered ? 0 : 1), 1, total);
+    $("#sessionCount").textContent = `${current} / ${total}`;
+
+    const roundEl = $("#sessionRound");
+    if (roundEl) {
+      const roundLabel = sessionRoundLabel(session);
+      roundEl.textContent = roundLabel;
+      roundEl.hidden = !roundLabel;
+    }
+
     $("#sessionScore").textContent = session.score;
-    const completed = session.index + (session.answered ? 1 : 0);
-    const pct = session.queue.length ? clamp(Math.round((completed / session.queue.length) * 100), 0, 100) : 0;
+    const pct = clamp(Math.round((done / total) * 100), 0, 100);
     $("#sessionBar").style.width = `${pct}%`;
   }
 
@@ -5208,15 +6158,87 @@
     return shuffle([entry, ...chosen]);
   }
 
+  // 每一轮开头的那条提示：告诉用户这一轮是练习、错词重写还是复习。
+  function roundNoticeHTML(session) {
+    const round = currentRound(session);
+    if (!round || round.key === "single" || round.key === "free" || !session.showRoundNotice) return "";
+    const meta = ROUND_META[round.key] || ROUND_META.single;
+    const number = roundNumberFor(session, round);
+    const count = round.items.length;
+    let hint = meta.hint;
+    if (round.key === "new") hint = `今天 ${count} 个新词，先过一遍`;
+    else if (round.key === "wrong") hint = `刚才写错的 ${count} 个词，再写一遍`;
+    else if (round.key === "review") hint = `${count} 个到期的旧词，看看还记得多少`;
+    else if (round.key === "free") hint = `${count} 个学过的词，随便练练`;
+    return `
+      <div class="round-notice is-${escAttr(round.key)}">
+        <span class="round-badge">第 ${number} 轮</span>
+        <div class="round-copy">
+          <strong>${esc(meta.title)}</strong>
+          <small>${esc(hint)}</small>
+        </div>
+      </div>`;
+  }
+
+  // 第 1 轮写错的词单独凑成第 2 轮，不插到新词里面。
+  function wrongRoundItems(session, round) {
+    const items = [];
+    const seen = new Set();
+    for (const item of round.items) {
+      const word = item.word && item.word.w;
+      if (!word || seen.has(word) || !session.wrongSet.has(word)) continue;
+      seen.add(word);
+      items.push({ word: item.word, isNew: false, bookId: item.bookId || session.bookId });
+    }
+    return items;
+  }
+
+  function hasMoreRounds(session) {
+    if (!session || !session.rounds) return false;
+    const round = currentRound(session);
+    // 第 1 轮刚练完时第 2 轮还没生成，靠错词数量预判一下。
+    if (round && round.key === "new" && !session.wrongRoundReady && session.wrongSet.size) return true;
+    return session.rounds.some((item, index) => index > session.roundIndex && item.items.length);
+  }
+
+  function advanceRound() {
+    const session = ui.session;
+    if (!session) return;
+    const round = currentRound(session);
+    if (round && round.key === "new" && !session.wrongRoundReady) {
+      session.wrongRoundReady = true;
+      const items = wrongRoundItems(session, round);
+      if (items.length) {
+        session.rounds.splice(session.roundIndex + 1, 0, { key: "wrong", items });
+      } else if (session.rounds.some((item) => item.key === "review" && item.items.length)) {
+        toast("这一轮全对，直接进入复习");
+      }
+    }
+    let next = session.roundIndex + 1;
+    while (next < session.rounds.length && !session.rounds[next].items.length) next += 1;
+    if (next >= session.rounds.length) {
+      finishSession();
+      return;
+    }
+    session.roundIndex = next;
+    session.queue = session.rounds[next].items;
+    session.index = 0;
+    session.answered = false;
+    session.showRoundNotice = true;
+    renderSession(true);
+    const body = $("#sessionBody");
+    if (body) body.scrollTop = 0;
+  }
+
   function renderSession(shouldSpeak = false) {
     const session = ui.session;
     if (!session) return;
     if (session.index >= session.queue.length) {
-      finishSession();
+      advanceRound();
       return;
     }
     const item = session.queue[session.index];
-    const book = bookById(session.bookId);
+    const book = bookById(item.bookId || session.bookId) || bookById(session.bookId);
     if (!book) {
       closeSession(true);
       return;
@@ -5226,7 +6248,8 @@
     session.selectedIndex = null;
     session.hintUsed = false;
     const body = $("#sessionBody");
-    body.innerHTML = questionHTML(item);
+    body.innerHTML = `${roundNoticeHTML(session)}${questionHTML(item)}`;
+    session.showRoundNotice = false;
     body.scrollTop = 0;
     updateSessionHeader();
 
@@ -5266,6 +6289,7 @@
     const selected = session.currentOptions[index];
     if (!selected) return;
     const entry = session.queue[session.index].word;
+    session.lastPickedWord = selected.w;
     handleAnswer(selected.w === entry.w, selected.m, index);
   }
 
@@ -5301,17 +6325,17 @@
     if (!session || session.answered) return;
     const item = session.queue[session.index];
     const entry = item.word;
-    const book = bookById(session.bookId);
-    if (!book) return;
+    const bookId = item.bookId || session.bookId;
 
     session.answered = true;
     session.selectedIndex = selectedIndex;
     session.attempts += 1;
+    session.done = (session.done || 0) + 1;
     const today = getToday();
     today.attempts += 1;
     store.totals.attempts += 1;
 
-    const progress = progressFor(book.id);
+    const progress = progressFor(bookId);
     const isNew = !progress[entry.w];
     let record = progress[entry.w];
     if (!record) {
@@ -5329,7 +6353,7 @@
       };
       progress[entry.w] = record;
       session.newCount += 1;
-      today.newByBook[book.id] = (today.newByBook[book.id] || 0) + 1;
+      today.newByBook[bookId] = (today.newByBook[bookId] || 0) + 1;
     }
 
     const now = Date.now();
@@ -5356,10 +6380,30 @@
       record.rightStreak = 0;
       record.mastered = false;
       record.due = now;
+      // 记下这次是怎么错的：拼写题记写了什么，选择题记选了哪个词，直接看答案也标出来。
+      const picked = session.mode === "en2zh"
+        ? String(session.lastPickedWord || "")
+        : String(userAnswer || "");
+      record.lastWrong = {
+        input: revealed ? "" : picked.trim().slice(0, 40),
+        mode: session.mode,
+        at: now,
+        revealed: Boolean(revealed),
+      };
       session.wrongSet.add(entry.w);
+      // 第 1 轮写错的词不插队重写，留到下一轮「错词重写」；其它轮按各自的次数插队。
+      const roundKey = currentRoundKey(session);
+      const retryLimit = ROUND_RETRY_LIMIT[roundKey] === undefined ? 2 : ROUND_RETRY_LIMIT[roundKey];
       const retryCount = item.retryCount || 0;
-      if (retryCount < 2) {
-        const retryItem = { word: entry, isNew: false, retry: true, retryCount: retryCount + 1 };
+      if (retryCount < retryLimit) {
+        const retryItem = {
+          word: entry,
+          isNew: false,
+          retry: true,
+          retryCount: retryCount + 1,
+          bookId: item.bookId,
+          round: roundKey,
+        };
         const position = Math.min(session.index + 3, session.queue.length);
         session.queue.splice(position, 0, retryItem);
       }
@@ -5417,6 +6461,9 @@
       ? `<div class="your-answer">${session.mode === "en2zh" ? "你的选择" : "你的答案"}：<s>${esc(userAnswer)}</s></div>`
       : "";
 
+    const roundDone = session.index + 1 >= session.queue.length;
+    const nextLabel = !roundDone ? "下一题" : hasMoreRounds(session) ? "进入下一轮" : "查看结果";
+
     const feedback = `
       <div class="feedback ${isCorrect ? "correct" : "wrong"}" id="feedback">
         <div class="feedback-head">
@@ -5434,7 +6481,7 @@
         ${yourAnswer}
         ${example}
         <div class="answer-actions">
-          <button class="primary-btn" type="button" data-next>${session.index + 1 >= session.queue.length ? "查看结果" : "下一题"}</button>
+          <button class="primary-btn" type="button" data-next>${nextLabel}</button>
         </div>
         <div class="keyboard-tip">按 <kbd>Enter</kbd> 继续</div>
       </div>`;
@@ -5453,8 +6500,9 @@
     const session = ui.session;
     if (!session || !session.answered) return;
     session.index += 1;
+    // 这一轮答完就换下一轮；最后一轮答完才出结果。
     if (session.index >= session.queue.length) {
-      finishSession();
+      advanceRound();
       return;
     }
     renderSession(true);
@@ -5496,20 +6544,30 @@
     updateWrongDot();
     updateSessionHeader();
 
-    $("#sessionBook").textContent = `${book ? book.name : "练习"} · ${MODE_LABEL[session.mode]}`;
+    $("#sessionBook").textContent = `${session.label || (book ? book.name : "练习")} · ${MODE_LABEL[session.mode]}`;
     $("#sessionCount").textContent = `${session.attempts} 题`;
+    const roundEl = $("#sessionRound");
+    if (roundEl) roundEl.hidden = true;
     $("#sessionBar").style.width = "100%";
 
     const wrongList = Array.from(session.wrongSet).slice(0, 30);
     const title = accuracy >= 90 ? "漂亮，完成！" : accuracy >= 70 ? "完成，继续保持" : "完成，再练一轮";
     const wrongChips = wrongList.map((word) => `
       <button class="result-wrong-word" type="button" data-word="${escAttr(word)}">${esc(word)}</button>`).join("");
+    // 三轮练习的结果里标一下每轮各练了多少，方便回看这一组是怎么走完的。
+    const roundLine = session.rounds && session.rounds.length > 1
+      ? session.rounds
+        .filter((round) => round.items.length)
+        .map((round) => `${(ROUND_META[round.key] || ROUND_META.single).title} ${round.items.length}`)
+        .join(" · ")
+      : "";
 
     $("#sessionBody").innerHTML = `
       <div class="result">
         <div class="result-mark">${ICONS.spark}</div>
         <h2>${title}</h2>
-        <p class="result-sub">${esc(book ? book.name : "")} · ${esc(MODE_LABEL[session.mode])}${session.newCount ? ` · 新词 ${session.newCount} 个` : ""}</p>
+        <p class="result-sub">${esc(session.label || (book ? book.name : ""))} · ${esc(MODE_LABEL[session.mode])}${session.newCount ? ` · 新词 ${session.newCount} 个` : ""}</p>
+        ${roundLine ? `<p class="result-rounds">${esc(roundLine)}</p>` : ""}
         <div class="result-score">${session.score}<span>分</span></div>
         <div class="result-stats">
           <div><strong>${accuracy}%</strong><small>正确率</small></div>
@@ -5550,17 +6608,20 @@
   function retryWrongWords() {
     const session = ui.session;
     if (!session) return;
-    const book = bookById(session.bookId);
-    if (!book) return;
-    const entries = Array.from(session.wrongSet)
-      .map((word) => book.words[book._index.get(word)])
-      .filter(Boolean);
-    if (!entries.length) {
+    const items = [];
+    const seen = new Set();
+    for (const item of sessionItems(session)) {
+      const word = item.word.w;
+      if (!session.wrongSet.has(word) || seen.has(word)) continue;
+      seen.add(word);
+      items.push({ entry: item.word, bookId: item.bookId || session.bookId });
+    }
+    if (!items.length) {
       toast("这次没有错词");
       return;
     }
     const mode = session.mode;
-    startSession(mode, { entries });
+    startSession(mode, { items });
   }
 
   function againSession() {
@@ -5753,6 +6814,26 @@
     $("#backdrop").addEventListener("click", closeSheet);
 
     $("#view").addEventListener("change", (event) => {
+      const box = event.target.closest("[data-wrong-select]");
+      if (box) {
+        if (box.checked) ui.wrongSelected.add(box.value);
+        else ui.wrongSelected.delete(box.value);
+        updateWrongBatchUI();
+        return;
+      }
+      const all = event.target.closest("[data-wrong-select-all]");
+      if (all) {
+        $$("#view [data-wrong-select]").forEach((input) => {
+          input.checked = all.checked;
+          if (all.checked) ui.wrongSelected.add(input.value);
+          else ui.wrongSelected.delete(input.value);
+        });
+        updateWrongBatchUI();
+        return;
+      }
+    });
+
+    $("#view").addEventListener("change", (event) => {
       const select = event.target.closest("[data-setting-select]");
       if (!select) return;
       if (select.dataset.settingSelect === "voice") {
@@ -5771,6 +6852,27 @@
     };
     $("#view").addEventListener("submit", runWordSearchForm);
     $("#sheetContent").addEventListener("submit", runWordSearchForm);
+
+    $("#sheetContent").addEventListener("submit", (event) => {
+      const addForm = event.target.closest("[data-add-book-form]");
+      if (addForm) {
+        event.preventDefault();
+        const input = $("[data-add-book-name]", addForm);
+        handleAddToNewBook(input ? input.value : "");
+        return;
+      }
+      const newForm = event.target.closest("[data-new-book-form]");
+      if (newForm) {
+        event.preventDefault();
+        handleNewBookForm(newForm);
+        return;
+      }
+      const renameForm = event.target.closest("[data-rename-book-form]");
+      if (renameForm) {
+        event.preventDefault();
+        handleRenameBookForm(renameForm);
+      }
+    });
 
     const onWordSearchInput = (event) => {
       const input = event.target.closest("[data-word-search-input]");
@@ -5796,7 +6898,21 @@
         return;
       }
       if (target.closest("[data-book-manage]")) {
-        openUploadManageSheet();
+        openUploadManageSheet(target.closest("[data-book-manage]").dataset.bookManage);
+        return;
+      }
+      if (target.closest("[data-new-personal-book]")) {
+        openNewBookSheet("manual");
+        return;
+      }
+      const targetChip = target.closest("[data-target-book]");
+      if (targetChip) {
+        setPersonalTargetForScope(targetChip.dataset.targetScope || "manual", targetChip.dataset.targetBook);
+        return;
+      }
+      const newBookChip = target.closest("[data-new-book]");
+      if (newBookChip) {
+        openNewBookSheet(newBookChip.dataset.newBook || "manual");
         return;
       }
       const bookButton = target.closest("[data-book]");
@@ -5837,9 +6953,23 @@
         handleManualToggle(manualToggle.dataset.manualToggle, manualToggle);
         return;
       }
+      const wrongScopeBtn = target.closest("[data-wrong-scope]");
+      if (wrongScopeBtn) {
+        ui.wrongScope = wrongScopeBtn.dataset.wrongScope || "";
+        renderWrong();
+        return;
+      }
       const wrongMode = target.closest("[data-wrong-mode]");
       if (wrongMode) {
-        startSession(wrongMode.dataset.wrongMode, { source: "wrong" });
+        // 练当前选中的范围（某一本或所有），每条带上自己的词库。
+        const scopeList = wrongListForScope(ui.wrongScope).slice(0, 30);
+        if (!scopeList.length) {
+          toast("这个范围还没有错词");
+          return;
+        }
+        startSession(wrongMode.dataset.wrongMode, {
+          items: scopeList.map(({ entry, bookId }) => ({ entry, bookId })),
+        });
         return;
       }
       const removeButton = target.closest("[data-remove-word]");
@@ -5847,12 +6977,20 @@
         removeWrongWord(removeButton.dataset.removeWord);
         return;
       }
+      if (target.closest("[data-wrong-delete]")) {
+        deleteSelectedWrong();
+        return;
+      }
       const settingButton = target.closest("[data-setting]");
       if (settingButton) {
         const key = settingButton.dataset.setting;
         const value = settingButton.dataset.value;
         if (key === "dailyNew") store.settings.dailyNew = clamp(parseInt(value, 10) || 20, 5, 100);
-        else if (key === "dailyReview") store.settings.dailyReview = clamp(parseInt(value, 10) || 20, 0, 100);
+        else if (key === "dailyReview") {
+          // 0 是合法值（今天不复习），不能被 `|| 20` 吃掉。
+          const review = parseInt(value, 10);
+          store.settings.dailyReview = clamp(Number.isFinite(review) ? review : 20, 0, 100);
+        }
         else if (key === "accent") {
           store.settings.accent = value === "uk" ? "uk" : "us";
           // 换口音时回到系统推荐，避免继续使用另一种口音的语音。
@@ -6033,7 +7171,42 @@
         return;
       }
       if (target.closest("[data-upload-clear]")) {
-        clearUpload();
+        clearUpload(ui.manageBookId);
+        return;
+      }
+      const addToBook = target.closest("[data-add-to-book]");
+      if (addToBook) {
+        handleAddToBook(addToBook.dataset.addToBook);
+        return;
+      }
+      const manageBookBtn = target.closest("[data-manage-book]");
+      if (manageBookBtn) {
+        openUploadManageSheet(manageBookBtn.dataset.manageBook);
+        return;
+      }
+      if (target.closest("[data-rename-book]")) {
+        openRenameBookSheet(ui.manageBookId);
+        return;
+      }
+      if (target.closest("[data-delete-book]")) {
+        const book = personalBook(ui.manageBookId);
+        if (book && confirm(`删除「${book.name}」？里面的词和这一本的练习进度都会删掉。`)) {
+          deletePersonalBook(book.id);
+          closeSheet();
+          renderCurrent();
+          ensureCurrentBook().catch(() => {});
+          toast(`已删除「${book.name}」`);
+        }
+        return;
+      }
+      const targetChipSheet = target.closest("[data-target-book]");
+      if (targetChipSheet) {
+        setPersonalTargetForScope(targetChipSheet.dataset.targetScope || "upload", targetChipSheet.dataset.targetBook);
+        return;
+      }
+      const newBookChipSheet = target.closest("[data-new-book]");
+      if (newBookChipSheet) {
+        openNewBookSheet(newBookChipSheet.dataset.newBook || "upload");
         return;
       }
       const bookButton = target.closest("[data-book-select]");
@@ -6049,6 +7222,19 @@
       const markButton = target.closest("[data-mark-word]");
       if (markButton) {
         markWord(markButton.dataset.markWord);
+        return;
+      }
+      const lookupBookBtn = target.closest("[data-lookup-book]");
+      if (lookupBookBtn) {
+        handleLookupBookPick(lookupBookBtn.dataset.lookupBook);
+        return;
+      }
+      if (target.closest("[data-lookup-new-book]")) {
+        // 记住当前查的词，建完本直接加进去再回到查词页。
+        const lookup = ui.currentLookup || {};
+        const word = String(lookup.base || "").toLowerCase();
+        ui.addBookWord = lookup.entry || (word ? { w: word, p: lookup.phonetic || "", m: lookup.meaning || "" } : null);
+        openNewBookSheet("lookup");
         return;
       }
       const personalLookupBtn = target.closest("[data-personal-word]");
@@ -6099,11 +7285,24 @@
     });
 
     $("#sheetContent").addEventListener("change", (event) => {
+      const group = event.target.closest("[data-group]");
+      if (group) {
+        // 组头：一键勾选/取消这一组的所有词汇本。
+        const key = group.dataset.group;
+        for (const box of scopeCheckboxes()) {
+          if (scopeCategory(box.dataset.scope) === key) box.checked = group.checked;
+        }
+        updateDataTransferUI();
+        return;
+      }
+      if (event.target.closest("[data-scope-all]")) {
+        const all = $("#sheetContent [data-scope-all]");
+        for (const box of scopeCheckboxes()) box.checked = all.checked;
+        updateDataTransferUI();
+        return;
+      }
       const scope = event.target.closest("[data-scope]");
       if (scope) {
-        if (scope.dataset.scope === "all") {
-          for (const box of scopeCheckboxes()) box.checked = scope.checked;
-        }
         updateDataTransferUI();
         return;
       }
