@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.8.0";
+  const APP_VERSION = "1.8.1";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -156,6 +156,7 @@
     manualTargetId: "",
     wrongSelected: new Set(),
     wrongScope: "",
+    importDraft: null,
   };
 
   let store = loadStore();
@@ -1505,6 +1506,7 @@
     }, 290);
     ui.lookupToken += 1;
     ui.uploadDraft = null;
+    ui.importDraft = null;
     if (ui.lastFocus && typeof ui.lastFocus.focus === "function") {
       try { ui.lastFocus.focus({ preventScroll: true }); } catch (error) { /* ignore */ }
     }
@@ -2588,17 +2590,19 @@
   }
 
   // 错词散在各个词库的 progress 里，集中抽出来便于单独导出。
-  function wrongWordsFrom(progress) {
+  // names 可选：导入别人的备份时用它把旧 id 翻成词汇本名字。
+  function wrongWordsFrom(progress, names = null) {
     const out = [];
     const books = progress && typeof progress === "object" ? progress : {};
     for (const bookId of Object.keys(books)) {
       const map = books[bookId];
       if (!map || typeof map !== "object") continue;
+      const label = (names && names[bookId]) || bookLabel(bookId);
       for (const word of Object.keys(map)) {
         const item = map[word];
         if (!item || typeof item !== "object") continue;
         if (!(item.wrongCount > 0) || item.mastered) continue;
-        out.push({ b: bookId, n: bookLabel(bookId), w: word, i: item });
+        out.push({ b: bookId, n: label, w: word, i: item });
       }
     }
     return out;
@@ -2664,7 +2668,14 @@
       };
     }
     if (wrongIds.size) payload.wrong = collectWrongWords().filter((row) => wrongIds.has(row.b));
-    if (set.has("records")) payload.data = store;
+    if (set.has("records")) {
+      payload.data = store;
+      // 个人本的 id 换设备就变了，带上 id→名字 的对照表，导入时才能把进度认回来。
+      const names = {};
+      for (const meta of state.meta.books) names[meta.id] = meta.name || meta.short || meta.id;
+      for (const id of Object.keys(store.progress || {})) if (!names[id]) names[id] = id;
+      payload.bookNames = names;
+    }
     return payload;
   }
 
@@ -2736,7 +2747,7 @@
         <button class="primary-btn" type="button" data-data-export>${ICONS.download} 导出全部数据</button>
         <button class="ghost-btn" type="button" data-data-import>${ICONS.upload} 选文件导入</button>
       </div>
-      <div class="sheet-note">导出一个 JSON 文件，换设备时把它拷过去导入即可。<br>只勾一本词汇本，导出的文件里就只有那一本；错词同理。<br>导入时「词汇本」和「错词」按词合并，已有的不会重复；勾了「学习记录」会用文件里的进度、统计和设置覆盖本机。</div>
+      <div class="sheet-note">导出一个 JSON 文件，换设备时把它拷过去导入即可。<br>上面勾的只影响导出：只勾一本词汇本，文件里就只有那一本；错词同理。<br>导入时会先列出文件里有什么，再挑要导入的部分；词汇本和错词都按词合并，已有的不会重复。</div>
     `, { focus: false });
     updateDataTransferUI();
   }
@@ -2812,18 +2823,55 @@
     toast(`已导出：${chosen.map(scopeLabel).join("、")}`);
   }
 
-  // 兼容旧备份：没有 scopes 字段时，按文件里实际有的内容推断。
-  function availableScopes(parsed) {
-    const out = [];
-    const hasPersonal = Boolean(parsed && (
-      (parsed.personal && Array.isArray(parsed.personal.books))
-      || (parsed.upload && Array.isArray(parsed.upload.words))
-    ));
-    if (hasPersonal) out.push("personal");
-    // 旧备份没有单独的 wrong 字段，错词藏在 data.progress 里，也能单独取出来。
-    if (parsed && (Array.isArray(parsed.wrong) || (parsed.data && parsed.data.progress))) out.push("wrong");
-    if (parsed && parsed.data && typeof parsed.data === "object") out.push("records");
-    return out;
+  // 词汇本名字的唯一键：和新建/改名时的清洗规则保持一致，跨设备才能对上。
+  function personalNameKey(name, fallback = "个人词汇") {
+    return String(name == null ? "" : name).replace(/\s+/g, " ").trim().slice(0, PERSONAL_NAME_MAX) || fallback;
+  }
+
+  // 列出文件里到底有什么。id 一律用「名字」而不是本机 id：
+  // 换一台机器后 personal:<id> 根本不存在，照着本机 id 去比对永远是空的。
+  function fileScopes(parsed) {
+    const rows = [];
+    const section = parsed && (parsed.personal || parsed.upload || null);
+    if (section && typeof section === "object") {
+      const books = Array.isArray(section.books)
+        ? section.books.filter((book) => book && Array.isArray(book.words))
+        : (Array.isArray(section.words) ? [{ name: "个人词汇", words: section.words }] : []);
+      const seen = new Set();
+      for (const book of books) {
+        const name = personalNameKey(book.name);
+        if (seen.has(name)) continue;
+        seen.add(name);
+        rows.push({
+          id: `personal:${name}`,
+          cat: "personal",
+          name,
+          label: name,
+          hint: `${book.words.length} 词`,
+          count: book.words.length,
+        });
+      }
+    }
+    const wrongList = Array.isArray(parsed && parsed.wrong)
+      ? parsed.wrong
+      : wrongWordsFrom(parsed && parsed.data && parsed.data.progress, parsed && parsed.bookNames);
+    const byBook = new Map();
+    for (const row of wrongList) {
+      if (!row || !row.w) continue;
+      const label = personalNameKey(row.n || row.b, row.b || "错词");
+      const item = byBook.get(label) || { id: `wrong:${label}`, cat: "wrong", name: label, label, count: 0 };
+      item.count += 1;
+      byBook.set(label, item);
+    }
+    for (const item of byBook.values()) rows.push({ ...item, hint: `${item.count} 个错词` });
+    if (parsed && parsed.data && typeof parsed.data === "object") {
+      rows.push({ id: "records", cat: "records", label: "学习记录", hint: "进度、统计、历史与设置" });
+    }
+    return rows;
+  }
+
+  function fileCats(parsed) {
+    return new Set(fileScopes(parsed).map((row) => row.cat));
   }
 
   // 个人本的 id 换设备会变，错词行里带了词汇本名字，可以按名字找回来。
@@ -2832,9 +2880,10 @@
     if (!id) return "";
     if (state.meta.books.some((meta) => meta.id === id)) return id;
     if (row.n) {
-      const byName = personalBooks().find((book) => book.name === row.n);
+      const key = personalNameKey(row.n, row.n);
+      const byName = personalBooks().find((book) => personalNameKey(book.name, book.name) === key);
       if (byName) return byName.id;
-      const meta = state.meta.books.find((item) => (item.name || item.short) === row.n);
+      const meta = state.meta.books.find((item) => personalNameKey(item.name || item.short, String(item.id)) === key);
       if (meta) return meta.id;
     }
     return id;
@@ -2875,13 +2924,35 @@
   // 导入个人词汇：新备份按词汇本逐本合并（同名合并、没有名字就新建），
   // 老备份只有一组 words，统一并进「个人词汇」这一本。
   // nameFilter 有值时只导入这几本（对应「只勾了某一本」）。
+  function findOrCreatePersonalBook(name) {
+    const clean = personalNameKey(name);
+    const found = personalBooks().find((book) => book.name === clean);
+    if (found) return found;
+    try {
+      return createPersonalBook(clean);
+    } catch (error) {
+      const again = personalBooks().find((book) => book.name === clean);
+      if (again) return again;
+    }
+    // 名字被占（截断或大小写不同）时，另建一本带序号的，绝不把词倒进别的本。
+    for (let index = 2; index < 50; index += 1) {
+      const alt = `${clean.slice(0, Math.max(1, PERSONAL_NAME_MAX - 3))} ${index}`;
+      try {
+        return createPersonalBook(alt);
+      } catch (error) {
+        if (personalBooks().some((book) => book.name === alt)) return personalBooks().find((book) => book.name === alt);
+      }
+    }
+    return null;
+  }
+
   function mergePersonalFrom(section, nameFilter = null) {
     if (!section || typeof section !== "object") return 0;
     let incoming = Array.isArray(section.books)
       ? section.books
         .filter((book) => book && Array.isArray(book.words))
         .map((book) => ({
-          name: String(book.name || "个人词汇").trim().slice(0, PERSONAL_NAME_MAX) || "个人词汇",
+          name: personalNameKey(book.name),
           words: book.words,
           files: book.files,
         }))
@@ -2893,14 +2964,7 @@
     for (const item of incoming) {
       const words = item.words.filter((entry) => entry && entry.w);
       if (!words.length) continue;
-      let target = personalBooks().find((book) => book.name === item.name);
-      if (!target) {
-        try {
-          target = createPersonalBook(item.name);
-        } catch (error) {
-          target = personalBooks()[0] || null;
-        }
-      }
+      const target = findOrCreatePersonalBook(item.name);
       if (!target) continue;
       const result = mergeUpload(words, "", { manual: true, bookId: target.id });
       const files = Array.isArray(item.files) ? item.files : [];
@@ -2941,59 +3005,165 @@
       const cat = id.slice(0, cut);
       const sub = id.slice(cut + 1);
       if (cat === "personal") {
+        // sub 可能是本机 id，也可能是文件里带的词汇本名字，两种都要认。
         const book = personalBook(sub);
-        if (book) sel.personalNames.add(book.name);
-        else sel.allPersonal = true;
+        sel.personalNames.add(book ? book.name : personalNameKey(sub));
       } else if (cat === "wrong") {
         const meta = state.meta.books.find((item) => item.id === sub);
         sel.wrongIds.add(sub);
-        if (meta) sel.wrongNames.add(meta.name || meta.short);
+        sel.wrongNames.add(meta ? (meta.name || meta.short) : personalNameKey(sub, sub));
       }
     }
     return sel;
   }
 
+  // 换设备后个人本的 id 会变：把文件里旧 id 的进度并到本机同名那一本上。
+  function remapProgressBookIds(names) {
+    if (!names || typeof names !== "object") return 0;
+    if (!store.progress || typeof store.progress !== "object") store.progress = {};
+    let moved = 0;
+    for (const from of Object.keys(store.progress)) {
+      if (state.meta.books.some((meta) => meta.id === from)) continue;
+      const label = names[from];
+      if (!label) continue;
+      const book = personalBooks().find((item) => personalNameKey(item.name, item.name) === personalNameKey(label, label));
+      if (!book || book.id === from) continue;
+      const source = store.progress[from] || {};
+      const target = store.progress[book.id] || (store.progress[book.id] = {});
+      for (const word of Object.keys(source)) {
+        const item = source[word];
+        if (!item || typeof item !== "object") continue;
+        const existing = target[word];
+        if (!existing) {
+          target[word] = item;
+          continue;
+        }
+        existing.wrongCount = Math.max(Number(existing.wrongCount) || 0, Number(item.wrongCount) || 0);
+        existing.level = Math.max(Number(existing.level) || 0, Number(item.level) || 0);
+        existing.rightStreak = Math.max(Number(existing.rightStreak) || 0, Number(item.rightStreak) || 0);
+        const dueA = Number(existing.due);
+        const dueB = Number(item.due);
+        if (Number.isFinite(dueB) && (!Number.isFinite(dueA) || dueB < dueA)) existing.due = dueB;
+        if (!item.mastered) existing.mastered = false;
+      }
+      delete store.progress[from];
+      moved += 1;
+    }
+    if (moved) saveStore();
+    return moved;
+  }
+
   function applyImport(parsed, scopes) {
-    const available = availableScopes(parsed);
+    const cats = fileCats(parsed);
     const sel = importSelection(scopes);
     const wantsPersonal = sel.allPersonal || sel.personalNames.size > 0;
     const wantsWrong = sel.allWrong || sel.wrongNames.size > 0;
-    if (!(sel.records && available.includes("records"))
-      && !(wantsPersonal && available.includes("personal"))
-      && !(wantsWrong && available.includes("wrong"))) {
+    const recordsOk = sel.records && cats.has("records");
+    const personalOk = wantsPersonal && cats.has("personal");
+    const wrongOk = wantsWrong && cats.has("wrong");
+    if (!recordsOk && !personalOk && !wrongOk) {
       return { ok: false, message: "文件里没有你选中的数据" };
     }
     const parts = [];
     let recordsApplied = false;
-    if (sel.records && available.includes("records")) {
+    if (recordsOk) {
       store = loadStoreFrom(parsed.data);
       saveStore();
       recordsApplied = true;
       parts.push("学习记录");
     }
+    // 必须先建好词汇本，错词才认得回自己那一本（错词行里存的是名字）。
+    if (personalOk) {
+      const section = parsed.personal || parsed.upload || null;
+      const added = mergePersonalFrom(section, sel.allPersonal ? null : sel.personalNames);
+      parts.push(`个人词汇 +${added} 词`);
+    }
+    if (recordsApplied) remapProgressBookIds(parsed.bookNames);
     // 学习记录里已经带着错词，重复合并没有意义。
-    if (!recordsApplied && wantsWrong && available.includes("wrong")) {
+    if (!recordsApplied && wrongOk) {
       let list = Array.isArray(parsed.wrong)
         ? parsed.wrong
-        : wrongWordsFrom(parsed.data && parsed.data.progress);
+        : wrongWordsFrom(parsed.data && parsed.data.progress, parsed.bookNames);
       if (!sel.allWrong) {
-        list = list.filter((row) => sel.wrongIds.has(row.b) || (row.n && sel.wrongNames.has(row.n)));
+        list = list.filter((row) => sel.wrongIds.has(row.b)
+          || (row.n && sel.wrongNames.has(personalNameKey(row.n, row.n)))
+          || sel.wrongNames.has(row.b));
       }
       if (list.length) {
         const added = mergeWrongWords(list);
         parts.push(`错词 ${list.length} 个（新增 ${added}）`);
       }
     }
-    if (wantsPersonal && available.includes("personal")) {
-      const section = parsed.personal || parsed.upload || null;
-      const added = mergePersonalFrom(section, sel.allPersonal ? null : sel.personalNames);
-      parts.push(`个人词汇 +${added} 词`);
-    }
     if (!parts.length) return { ok: false, message: "选中的内容在文件里是空的" };
     return { ok: true, message: parts.join(" · ") };
   }
 
-  function importData(scopes = allScopeIds()) {
+  // 导入前先摊开文件里有什么：范围由文件内容决定，跟本机现有词汇本无关。
+  function openImportSheet(parsed, fileName) {
+    const rows = fileScopes(parsed);
+    if (!rows.length) {
+      toast("这个文件不是有效的词听备份", true);
+      return;
+    }
+    const row = (item) => `
+      <label class="scope-row is-child">
+        <input type="checkbox" data-import-scope="${escAttr(item.id)}" data-import-cat="${escAttr(item.cat)}" checked>
+        <span class="scope-text">
+          <strong>${esc(item.label)}</strong>
+          ${item.hint ? `<small>${esc(item.hint)}</small>` : ""}
+        </span>
+      </label>`;
+    const group = (cat, title, unit) => {
+      const items = rows.filter((item) => item.cat === cat);
+      if (!items.length) return "";
+      const total = items.reduce((sum, item) => sum + (item.count || 0), 0) || items.length;
+      return `
+        <div class="scope-group">
+          <label class="scope-row is-group">
+            <input type="checkbox" data-import-group="${escAttr(cat)}" checked>
+            <span class="scope-text"><strong>${esc(title)}</strong><small>${items.length} 项 · 共 ${total} ${unit}</small></span>
+          </label>
+          ${items.map(row).join("")}
+        </div>`;
+    };
+    const records = rows.find((item) => item.cat === "records");
+    openSheet(`
+      ${sheetHead("导入备份", `${fileName || "备份文件"} · 勾选要导入的部分`)}
+      <div class="scope-list">
+        ${group("personal", "个人词汇", "词")}
+        ${group("wrong", "错词", "个")}
+        ${records ? row(records) : ""}
+        <label class="scope-row is-all">
+          <input type="checkbox" data-import-all checked>
+          <span class="scope-text"><strong>全部</strong><small>文件里的全部内容</small></span>
+        </label>
+      </div>
+      <div class="upload-pick-actions">
+        <button class="primary-btn" type="button" data-import-go>${ICONS.download} 导入所选</button>
+      </div>
+      <div class="sheet-note">文件里的词汇本按「词」合并，本机已有的词不会重复添加；本机没有这个词汇本时会自动新建一个同名的。<br>勾了「学习记录」会用文件里的进度、统计和设置覆盖本机。</div>
+    `, { focus: false });
+    ui.importDraft = { parsed, fileName: fileName || "" };
+  }
+
+  // 组头、子项、「全部」三级联动。
+  function syncImportGroups() {
+    const boxes = $$("#sheetContent [data-import-scope]");
+    $$("#sheetContent [data-import-group]").forEach((head) => {
+      const cat = head.dataset.importGroup;
+      const children = boxes.filter((box) => box.dataset.importCat === cat);
+      const on = children.filter((box) => box.checked).length;
+      head.checked = children.length > 0 && on === children.length;
+      head.indeterminate = on > 0 && on < children.length;
+    });
+    const all = $("#sheetContent [data-import-all]");
+    if (!all) return;
+    const on = boxes.filter((box) => box.checked).length;
+    all.checked = boxes.length > 0 && on === boxes.length;
+    all.indeterminate = on > 0 && on < boxes.length;
+  }
+
+  function importData() {
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "application/json,.json";
@@ -3007,28 +3177,11 @@
       try {
         const text = await file.text();
         const parsed = JSON.parse(text);
-        const available = availableScopes(parsed);
-        if (!available.length) {
+        if (!fileScopes(parsed).length) {
           toast("这个文件不是有效的词听备份", true);
           return;
         }
-        const chosenCats = new Set(scopes.map(scopeCategory));
-        if (!available.some((id) => chosenCats.has(id))) {
-          toast("文件里没有你选中的数据", true);
-          return;
-        }
-        const replace = available.includes("records") && chosenCats.has("records");
-        const question = replace
-          ? "导入「学习记录」会用文件里的进度、统计和设置覆盖本机，确定继续吗？"
-          : "会把文件里的数据合并到本机，已有的词不会重复添加，确定继续吗？";
-        if (!confirm(question)) return;
-        const result = applyImport(parsed, scopes);
-        if (!result.ok) {
-          toast(result.message, true);
-          return;
-        }
-        toast(`导入成功：${result.message}，正在重新打开…`);
-        setTimeout(() => location.reload(), 800);
+        openImportSheet(parsed, file.name);
       } catch (error) {
         console.warn(error);
         toast("导入失败：文件格式不正确", true);
@@ -7134,12 +7287,32 @@
         return;
       }
       if (target.closest("[data-data-import]")) {
-        const chosen = selectedScopes();
-        if (!chosen.length) {
-          toast("先选择要导入的数据范围", true);
+        importData();
+        return;
+      }
+      if (target.closest("[data-import-go]")) {
+        const draft = ui.importDraft;
+        if (!draft) {
+          toast("请重新选择文件", true);
           return;
         }
-        importData(chosen);
+        const scopes = $$("#sheetContent [data-import-scope]")
+          .filter((box) => box.checked)
+          .map((box) => box.dataset.importScope);
+        if (!scopes.length) {
+          toast("先勾选要导入的内容", true);
+          return;
+        }
+        if (scopes.includes("records")
+          && !confirm("导入「学习记录」会用文件里的进度、统计和设置覆盖本机，确定继续吗？")) return;
+        const result = applyImport(draft.parsed, scopes);
+        if (!result.ok) {
+          toast(result.message, true);
+          return;
+        }
+        ui.importDraft = null;
+        toast(`导入成功：${result.message}，正在重新打开…`);
+        setTimeout(() => location.reload(), 800);
         return;
       }
       if (target.closest("[data-close-sheet]")) {
@@ -7285,6 +7458,25 @@
     });
 
     $("#sheetContent").addEventListener("change", (event) => {
+      if (event.target.closest("[data-import-all]")) {
+        const all = $("#sheetContent [data-import-all]");
+        for (const box of $$("#sheetContent [data-import-scope]")) box.checked = all.checked;
+        syncImportGroups();
+        return;
+      }
+      const importGroup = event.target.closest("[data-import-group]");
+      if (importGroup) {
+        const cat = importGroup.dataset.importGroup;
+        for (const box of $$("#sheetContent [data-import-scope]")) {
+          if (box.dataset.importCat === cat) box.checked = importGroup.checked;
+        }
+        syncImportGroups();
+        return;
+      }
+      if (event.target.closest("[data-import-scope]")) {
+        syncImportGroups();
+        return;
+      }
       const group = event.target.closest("[data-group]");
       if (group) {
         // 组头：一键勾选/取消这一组的所有词汇本。

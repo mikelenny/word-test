@@ -4574,6 +4574,11 @@ body.sheet-open {
   flex: none;
   width: 15px;
   height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .upload-pick-actions .primary-btn:disabled {
