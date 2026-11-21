@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "2.0.15";
+  const APP_VERSION = "2.0.16";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -1820,6 +1820,59 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  /* ---------- 边缘滑动返回首页 ----------
+     手机浏览器的屏幕边缘滑动会走 history.back()，历史栈空了就直接退出浏览器。
+     这里压一个哨兵历史项兜底：每次返回都落在自己的 popstate 里，逐层退回首页。 */
+  function pushHistoryGuard() {
+    try {
+      if (!history.state || history.state.citing !== "guard") {
+        history.pushState({ citing: "guard" }, "", location.pathname + location.hash);
+      }
+    } catch (error) { /* 某些浏览器限制 history，忽略即可 */ }
+  }
+
+  function goHomeFromEdge() {
+    if (ui.sheetOpen) { closeSheet(); return; }
+    if (ui.session) { closeSession(true); return; }
+    if (ui.tab !== "home") { switchTab("home"); return; }
+  }
+
+  function bindEdgeBackGesture() {
+    window.addEventListener("popstate", () => {
+      goHomeFromEdge();
+      pushHistoryGuard();
+    });
+    pushHistoryGuard();
+
+    // 独立版/无浏览器外壳时原生手势可能不触发历史，补一层触摸边缘滑动。
+    let edgeStart = null;
+    document.addEventListener("touchstart", (event) => {
+      if (event.touches.length !== 1) { edgeStart = null; return; }
+      const touch = event.touches[0];
+      const fromLeft = touch.clientX <= 28;
+      const fromRight = touch.clientX >= window.innerWidth - 28;
+      if (!fromLeft && !fromRight) { edgeStart = null; return; }
+      const target = event.target;
+      // 软键盘、横向词条、弹层里滑动是正常操作，别误判成返回。
+      if (target && target.closest && target.closest(".soft-keyboard, .book-strip, .sheet, input, textarea")) {
+        edgeStart = null;
+        return;
+      }
+      edgeStart = { x: touch.clientX, y: touch.clientY, dir: fromLeft ? 1 : -1, at: Date.now() };
+    }, { passive: true });
+    document.addEventListener("touchend", (event) => {
+      const start = edgeStart;
+      edgeStart = null;
+      if (!start || !event.changedTouches || !event.changedTouches.length) return;
+      const touch = event.changedTouches[0];
+      const dx = (touch.clientX - start.x) * start.dir;
+      const dy = Math.abs(touch.clientY - start.y);
+      if (dx > 90 && dy < 60 && Date.now() - start.at < 900) {
+        goHomeFromEdge();
+      }
+    }, { passive: true });
+  }
+
   function renderCurrent() {
     updateChrome();
     if (ui.tab === "home") renderHome();
@@ -2484,9 +2537,9 @@
       <article class="wrong-item" data-wrong-row="${escAttr(entry.w)}" data-wrong-key="${escAttr(key)}">
         <input class="wrong-check" type="checkbox" data-wrong-select value="${escAttr(key)}" aria-label="选择 ${escAttr(entry.w)}">
         <div class="wrong-item-top">
-          <div>
+          <div class="wrong-word-line">
             <button class="wrong-word" type="button" data-word="${escAttr(entry.w)}">${esc(entry.w)}</button>
-            ${entry.p ? `<div class="wrong-phonetic">/${esc(entry.p)}/</div>` : ""}
+            ${entry.p ? `<span class="wrong-phonetic">/${esc(entry.p)}/</span>` : ""}
           </div>
           <button class="mini-btn" type="button" data-speak="${escAttr(entry.w)}" aria-label="朗读 ${escAttr(entry.w)}">${ICONS.speaker}</button>
         </div>
@@ -8468,5 +8521,6 @@
   }
 
   bindEvents();
+  bindEdgeBackGesture();
   init();
 })();

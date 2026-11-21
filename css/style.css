@@ -311,7 +311,7 @@ svg {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
-  margin: 26px 2px 12px;
+  margin: 17px 2px 8px;
 }
 
 .section-head h2 {
@@ -461,8 +461,8 @@ svg {
 .hero {
   position: relative;
   overflow: hidden;
-  margin-top: 8px;
-  padding: 20px 20px 18px;
+  margin-top: 4px;
+  padding: 14px 18px 13px;
   border-radius: var(--radius-xl);
   color: #faf7ee;
   background:
@@ -526,7 +526,7 @@ svg {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-top: 12px;
+  margin-top: 8px;
 }
 
 .hero-number {
@@ -537,7 +537,7 @@ svg {
 
 .hero-number strong {
   font-family: var(--font-serif);
-  font-size: 48px;
+  font-size: 40px;
   line-height: 1;
   font-weight: 600;
   letter-spacing: -0.03em;
@@ -559,8 +559,8 @@ svg {
   --p: 0;
   position: relative;
   flex: none;
-  width: 74px;
-  height: 74px;
+  width: 62px;
+  height: 62px;
   border-radius: 50%;
   background: conic-gradient(var(--amber) calc(var(--p) * 1%), rgba(250, 247, 238, 0.13) 0);
   display: grid;
@@ -587,7 +587,7 @@ svg {
   position: relative;
   z-index: 1;
   height: 5px;
-  margin-top: 16px;
+  margin-top: 10px;
   border-radius: 99px;
   overflow: hidden;
   background: rgba(250, 247, 238, 0.13);
@@ -609,7 +609,7 @@ svg {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-top: 10px;
+  margin-top: 7px;
   font-size: 11px;
   color: rgba(250, 247, 238, 0.58);
 }
@@ -623,7 +623,7 @@ svg {
   display: flex;
   gap: 10px;
   overflow-x: auto;
-  padding: 2px 2px 8px;
+  padding: 2px 2px 5px;
   margin: 0 -2px;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
@@ -636,7 +636,7 @@ svg {
 
 .book-card {
   text-align: left;
-  padding: 13px 14px 12px;
+  padding: 10px 12px 9px;
   border-radius: 18px;
   border: 1.5px solid var(--line);
   background: rgba(255, 253, 247, 0.62);
@@ -676,7 +676,7 @@ svg {
   display: block;
   color: var(--muted);
   font-size: 11px;
-  margin-bottom: 9px;
+  margin-bottom: 6px;
 }
 
 .mini-progress {
@@ -701,7 +701,7 @@ svg {
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 10px;
-  margin: 8px 2px 0;
+  margin: 5px 2px 0;
 }
 
 .range-chip {
@@ -736,13 +736,13 @@ svg {
 .mode-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 11px;
+  gap: 8px;
 }
 
 .mode-card {
   position: relative;
-  min-height: 78px;
-  padding: 13px 14px 12px;
+  min-height: 66px;
+  padding: 10px 12px 9px;
   border-radius: var(--radius-lg);
   text-align: left;
   display: flex;
@@ -858,7 +858,7 @@ svg {
 }
 
 .mode-note {
-  margin: 9px 2px 0;
+  margin: 6px 2px 0;
   color: var(--faint);
   font-size: 11px;
   text-align: center;
@@ -872,8 +872,8 @@ svg {
   gap: 7px;
   width: fit-content;
   max-width: 100%;
-  margin: 8px auto 0;
-  padding: 5px 12px;
+  margin: 6px auto 0;
+  padding: 4px 12px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--card);
@@ -943,10 +943,10 @@ svg {
 .wrong-teaser {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-top: 20px;
-  padding: 14px 15px;
-  border-radius: 18px;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 16px;
   background: var(--card);
   border: 1px solid var(--line);
   box-shadow: var(--shadow-soft);
@@ -1049,8 +1049,8 @@ svg {
 
 /* 词汇搜索下拉：手动检录 / 词库浏览 / 个人词汇管理共用 */
 .manual-add {
-  margin-top: 16px;
-  padding: 16px 18px 18px;
+  margin-top: 12px;
+  padding: 12px 14px 14px;
   border-radius: var(--radius-lg);
   background: var(--card);
   border: 1px solid var(--line);
@@ -1282,7 +1282,7 @@ svg {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin: 6px 2px 2px;
+  margin: 4px 2px 2px;
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
@@ -1547,7 +1547,7 @@ svg {
 }
 
 .tip-line {
-  margin: 18px 2px 0;
+  margin: 12px 2px 0;
   text-align: center;
   color: var(--faint);
   font-size: 11px;
@@ -1712,7 +1712,7 @@ svg {
 .wrong-actions {
   display: flex;
   gap: 9px;
-  margin-bottom: 16px;
+  margin-bottom: 10px;
 }
 
 .wrong-actions .primary-btn {
@@ -1727,7 +1727,7 @@ svg {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 2px 2px 10px;
+  margin: 0 2px 7px;
 }
 
 .wrong-batch-all {
@@ -1755,13 +1755,13 @@ svg {
 .wrong-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 7px;
 }
 
 .wrong-item {
   position: relative;
-  padding: 15px 15px 13px 40px;
-  border-radius: 18px;
+  padding: 11px 13px 10px 38px;
+  border-radius: 16px;
   background: var(--card);
   border: 1px solid var(--line);
   box-shadow: var(--shadow-soft);
@@ -1775,8 +1775,8 @@ svg {
 
 .wrong-check {
   position: absolute;
-  left: 13px;
-  top: 17px;
+  left: 11px;
+  top: 13px;
 }
 
 .wrong-attempt {
@@ -1784,8 +1784,8 @@ svg {
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 9px;
-  padding: 7px 10px;
+  margin-top: 6px;
+  padding: 5px 9px;
   border-radius: 10px;
   background: rgba(178, 88, 56, 0.07);
   border: 1px dashed rgba(178, 88, 56, 0.26);
@@ -1836,9 +1836,18 @@ svg {
 
 .wrong-item-top {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+/* 音标跟在单词后面同一行，短词不换行占两行 */
+.wrong-word-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
 }
 
 .wrong-word {
@@ -1854,14 +1863,14 @@ svg {
 .wrong-phonetic {
   color: var(--muted);
   font-size: 12px;
-  margin-top: 2px;
+  line-height: 1.25;
 }
 
 .wrong-meaning {
-  margin-top: 7px;
+  margin-top: 4px;
   color: var(--ink-soft);
   font-size: 13px;
-  line-height: 1.55;
+  line-height: 1.45;
 }
 
 .wrong-foot {
@@ -1869,8 +1878,8 @@ svg {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-top: 10px;
-  padding-top: 9px;
+  margin-top: 7px;
+  padding-top: 6px;
   border-top: 1px dashed var(--line);
 }
 

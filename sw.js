@@ -1,5 +1,9 @@
 /* 词听 offline cache */
-const CACHE = "citing-v2.0.15";
+// 外壳随版本换名（小文件，装新版本时重新拉一次没问题）。
+const CACHE = "citing-v2.0.16";
+// 词库数据单独放固定名字的缓存：升级外壳时不会删掉它，也就不必每次重新下载 dict.json。
+// 只有数据文件本身的结构/内容改版时才手动把 v1 改成 v2。
+const DATA_CACHE = "citing-data-v1";
 const CORE = [
   "./",
   "./index.html",
@@ -64,7 +68,7 @@ function notifyClients(message) {
 }
 
 async function cacheData() {
-  const cache = await caches.open(CACHE);
+  const cache = await caches.open(DATA_CACHE);
   let done = 0;
   for (const url of DATA) {
     const cached = await cache.match(url);
@@ -94,7 +98,7 @@ function ensureDataCached() {
 }
 
 async function offlineStatus() {
-  const cache = await caches.open(CACHE);
+  const cache = await caches.open(DATA_CACHE);
   let done = 0;
   for (const url of DATA) {
     if (await cache.match(url)) done += 1;
@@ -109,13 +113,32 @@ self.addEventListener("install", (event) => {
   })());
 });
 
+// 老版本把词库也存在按版本命名的缓存里。升级时先搬进固定名的数据缓存，
+// 这样老用户不用重新下载一遍 dict.json / books。
+async function migrateLegacyData(keys) {
+  const target = await caches.open(DATA_CACHE);
+  for (const key of keys) {
+    if (key === CACHE || key === DATA_CACHE) continue;
+    const old = await caches.open(key);
+    await Promise.all(DATA.map(async (url) => {
+      if (await target.match(url)) return;
+      try {
+        const response = await old.match(url);
+        if (response) await target.put(url, response.clone());
+      } catch (error) { /* 单个文件搬不动就算了，后台会补 */ }
+    }));
+  }
+}
+
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
     // claim 之前先记下「原本就被旧版本控制的页面」：只有它们需要刷新。
     // 第一次安装时这里是空的，不会把用户刚打开的页面刷掉。
     const controlled = await self.clients.matchAll({ type: "window", includeUncontrolled: false });
     const keys = await caches.keys();
-    await Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)));
+    await migrateLegacyData(keys);
+    const keep = [CACHE, DATA_CACHE];
+    await Promise.all(keys.filter((key) => !keep.includes(key)).map((key) => caches.delete(key)));
     await self.clients.claim();
     for (const client of controlled) {
       try {
@@ -153,24 +176,37 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
 
-  // 页面导航走「网络优先」：在线时总能拿到最新 HTML，弱网 2.5 秒拿不到就用缓存里的外壳。
-  // 静态资源仍是缓存优先，版本由 CACHE 名字控制。
-  if (request.mode === "navigate") {
+  // 只有应用外壳本身（根路径 / index.html）走缓存优先；别的页面照常走网络，
+  // 否则任何同源导航都会被错误地替换成缓存里的 index.html。
+  const scopePath = new URL("./", self.location.href).pathname;
+  const isShell = url.pathname === scopePath || url.pathname === scopePath + "index.html";
+  if (request.mode === "navigate" && isShell) {
     event.respondWith((async () => {
       const cache = await caches.open(CACHE);
+      const cached = (await cache.match(request))
+        || (await cache.match("./index.html"))
+        || (await cache.match("./"));
+      if (cached) {
+        // 不 await：把刷新放到后台，首屏立刻返回缓存。
+        fetchWithTimeout(request, 6000).then((response) => {
+          if (!response || !response.ok) return;
+          const forRequest = response.clone();
+          cache.put(request, forRequest).catch(() => {});
+          cache.put("./index.html", response.clone()).catch(() => {});
+        }).catch(() => {});
+        return cached;
+      }
+      // 首次打开还没有缓存：只能等网络，但顺手把外壳存下来。
       try {
-        const response = await fetchWithTimeout(request, 2500);
+        const response = await fetchWithTimeout(request, 8000);
         if (response && response.ok) {
+          const forRequest = response.clone();
+          cache.put(request, forRequest).catch(() => {});
           cache.put("./index.html", response.clone()).catch(() => {});
           return response;
         }
-      } catch (error) {
-        // 离线或网络太慢：落到下面的缓存里。
-      }
-      return (await cache.match(request))
-        || (await cache.match("./index.html"))
-        || (await cache.match("./"))
-        || Response.error();
+      } catch (error) { /* 落到下面尝试旧缓存 */ }
+      return Response.error();
     })());
     return;
   }
@@ -186,8 +222,10 @@ self.addEventListener("fetch", (event) => {
     try {
       const response = await fetch(request);
       if (response && response.ok) {
-        const cache = await caches.open(CACHE);
-        cache.put(request, response.clone()).catch(() => {});
+        // 按需抓到的词库写进固定数据缓存；外壳写进版本缓存。
+        const isData = DATA.some((path) => new URL(path, self.location.href).pathname === url.pathname);
+        const target = await caches.open(isData ? DATA_CACHE : CACHE);
+        target.put(request, response.clone()).catch(() => {});
         return response;
       }
       return response;
