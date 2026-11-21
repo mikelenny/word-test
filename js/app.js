@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "2.0.8";
+  const APP_VERSION = "2.0.11";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -1268,6 +1268,19 @@
     adv: { pos: "adv.", label: "副词" },
   };
   const FORM_POS_ORDER = ["v.", "n.", "adj.", "adv."];
+  // 手机空间紧：卡片上的行名用缩写，反馈页仍显示完整中文名。
+  const FORM_SHORT_LABELS = {
+    "原词": "pos.",
+    "过去式": "past",
+    "过去分词": "pp.",
+    "现在分词": "ing.",
+    "第三人称单数": "3rd",
+    "复数": "pl.",
+    "比较级": "comp.",
+    "最高级": "sup.",
+    "副词": "adv.",
+  };
+  const shortFormLabel = (label) => FORM_SHORT_LABELS[label] || label;
 
   // 同一行里可以放两个空：过去式 / 过去分词、比较级 / 最高级。
   // 这样 pay→paid / paid 和 do→did / done 都能让学生自己判断两者是否同形。
@@ -6567,15 +6580,15 @@
     const rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
     return `
       <div class="soft-keyboard" id="softKeyboard" aria-label="内置英文键盘">
-        ${rows.map((row) => `
+        ${rows.map((row, index) => `
           <div class="sk-row">
             ${Array.from(row).map((letter) => `<button class="sk-key" type="button" data-key="${letter}">${letter}</button>`).join("")}
+            ${index === 2 ? '<button class="sk-key special backspace" type="button" data-key="backspace" aria-label="删除一个字母">⌫</button>' : ""}
           </div>`).join("")}
         <div class="sk-row">
           <button class="sk-key special" type="button" data-key="'">'</button>
           <button class="sk-key special" type="button" data-key="-">-</button>
           <button class="sk-key special wide" type="button" data-key="space">空格</button>
-          <button class="sk-key special wide" type="button" data-key="backspace" aria-label="删除一个字母">⌫</button>
           <button class="sk-key special wide submit" type="button" data-key="submit">提交</button>
         </div>
       </div>`;
@@ -6584,12 +6597,16 @@
   function pressSoftKey(key) {
     const session = ui.session;
     if (!session || session.answered || session.mode === "en2zh") return;
-    // 多输入行时跟着当前光标走；没聚焦就落到第一行。
-    const active = document.activeElement;
-    const input = active && active.matches && active.matches("[data-field], #answerInput")
-      ? active
-      : ($("[data-field]", $("#sessionBody")) || $("#answerInput"));
+    // 手机内置键盘：点按键时按钮会抢走焦点，所以用 focusin/pointerdown 记下最近点的输入框。
+    const focused = ui.activeSoftInput;
+    const active = focused && focused.isConnected && !focused.disabled
+      ? focused
+      : (document.activeElement && document.activeElement.matches
+        && document.activeElement.matches("[data-field], #answerInput")
+        ? document.activeElement : null);
+    const input = active || ($("[data-field]", $("#sessionBody")) || $("#answerInput"));
     if (!input) return;
+    ui.activeSoftInput = input;
     if (key === "submit") {
       submitSpelling();
       return;
@@ -6683,45 +6700,41 @@
               type="text" inputmode="${kb && isTouchDevice() ? "none" : "text"}"
               ${kb && isTouchDevice() ? "readonly" : ""}
               autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
-              enterkeyhint="done" aria-label="${escAttr(label)}"
-              placeholder="${kb ? "用下方键盘输入" : ""}">`;
+              enterkeyhint="done" aria-label="${escAttr(label)}">`;
+    const labelHTML = (label) => `<span class="dict-field-label">${esc(shortFormLabel(label))}</span>`;
     const fieldHTML = (label, index, extraClass = "") => `
           <div class="dict-field ${extraClass}">
-            <label class="dict-field-label" for="dictField${index}">${esc(label)}</label>${inputHTML(label, index)}
+            ${labelHTML(label)}${inputHTML(label, index)}
           </div>`;
 
     const lineHTML = (line) => {
       const cells = line.cells || [{ label: line.label }];
       if (cells.length < 2) return fieldHTML(cells[0].label, fieldIndex++);
-      // 成对变形：左边一个统一的行名，右边两个空并排，和其它行一样左对齐。
+      // 成对变形：左边上下两个缩写行名，右边两个空并排。
       return `
           <div class="dict-line is-pair">
-            <div class="dict-field-label dict-pair-label">${esc(line.label)}</div>
+            <div class="dict-pair-labels">${cells.map((cell) => labelHTML(cell.label)).join("")}</div>
             <div class="dict-pair-fields">
               ${cells.map((cell) => inputHTML(cell.label, fieldIndex++)).join("")}
             </div>
           </div>`;
     };
 
-    const groupRows = groups.map((group) => `
-          <div class="dict-group">
-            <div class="dict-group-title"><span class="dict-pos">${esc(group.pos)}</span>${esc(group.label)}</div>
-            ${group.lines.map(lineHTML).join("")}
-          </div>`).join("");
+    // 紧凑卡片：不再按词性加分组标题，所有行直接排在一起。
+    const linesHTML = groups.reduce((out, group) => out.concat(group.lines), []).map(lineHTML).join("");
 
     return `
         <div class="question-card is-multifield">
           <div class="question-inner">
             <div class="question-kicker"><span>看中文 · 写英文和变形</span>${questionTagsHTML(item)}</div>
             <div class="prompt-meaning">${meaning ? posMeaning(meaning) : "暂无释义"}</div>
-            <div class="prompt-sub">先写原词，再按词性写变形 · 过去式/过去分词、比较级/最高级各占两个空 · 有一空写错，整题算错</div>
             <div class="prompt-tools">
               <button class="audio-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker} 听发音</button>
               <button class="ghost-chip" type="button" data-skip-forms>只写原词</button>
             </div>
             <div class="dict-fields">
               ${fieldHTML("原词", 0, "is-base")}
-              ${groupRows}
+              ${linesHTML}
             </div>
             <div class="answer-row ${kb ? "is-soft" : ""}">
               ${kb ? "" : '<button class="primary-btn" type="button" data-submit>提交</button>'}
@@ -6845,7 +6858,8 @@
   // 每一轮开头的那条提示：告诉用户这一轮是练习、错词重写还是复习。
   function roundNoticeHTML(session) {
     const round = currentRound(session);
-    if (!round || round.key === "single" || round.key === "free" || !session.showRoundNotice) return "";
+    // 第 1 轮新词本身标题栏已经写了「第 1 轮」，不再占一整条绿色提示。
+    if (!round || round.key === "single" || round.key === "free" || round.key === "new" || !session.showRoundNotice) return "";
     const meta = ROUND_META[round.key] || ROUND_META.single;
     const number = roundNumberFor(session, round);
     const count = round.items.length;
@@ -6939,6 +6953,7 @@
       closeSession(true);
       return;
     }
+    ui.activeSoftInput = null;
     session.answered = false;
     session.currentOptions = session.mode === "en2zh" ? buildOptions(item.word, book) : null;
     session.selectedIndex = null;
@@ -7933,6 +7948,27 @@
         else if (action === "upload-file") openUploadPicker();
         else if (action === "manage-upload") openUploadManageSheet();
         return;
+      }
+    });
+
+    // 内置软键盘：记住最近点过的输入框，按键时不能让按钮抢走焦点。
+    $("#sessionBody").addEventListener("focusin", (event) => {
+      if (event.target && event.target.matches && event.target.matches("[data-field], #answerInput")) {
+        ui.activeSoftInput = event.target;
+      }
+    });
+    $("#sessionBody").addEventListener("pointerdown", (event) => {
+      if (!useSoftKeyboard()) return;
+      const input = event.target && event.target.closest
+        ? event.target.closest("[data-field], #answerInput") : null;
+      if (input) {
+        ui.activeSoftInput = input;
+        input.focus({ preventScroll: true });
+      }
+    });
+    $("#sessionBody").addEventListener("mousedown", (event) => {
+      if (event.target && event.target.closest && event.target.closest("[data-key]")) {
+        event.preventDefault();
       }
     });
 

@@ -2728,7 +2728,7 @@ svg {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 13px;
+  margin-top: 8px;
   flex-wrap: wrap;
 }
 
@@ -2736,8 +2736,8 @@ svg {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  min-height: 38px;
-  padding: 8px 13px;
+  min-height: 32px;
+  padding: 5px 11px;
   border-radius: 999px;
   background: var(--amber-soft);
   color: var(--amber-deep);
@@ -2763,8 +2763,8 @@ svg {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 38px;
-  padding: 8px 12px;
+  min-height: 32px;
+  padding: 5px 10px;
   border-radius: 999px;
   border: 1px solid var(--line);
   color: var(--muted);
@@ -2867,8 +2867,8 @@ svg {
 }
 
 .soft-keyboard {
-  margin-top: 10px;
-  padding: 8px;
+  margin-top: 6px;
+  padding: 6px;
   border-radius: 16px;
   background: var(--card-soft);
   border: 1px solid var(--line);
@@ -2879,13 +2879,22 @@ svg {
 
 /* 手机上让键盘变成一块接近全宽的浮空面板，可以稍微溢出答题卡底部。 */
 @media (max-width: 759px) {
+  .question-card.is-multifield .question-inner {
+    padding: 13px 14px 11px;
+  }
+
+  .question-card.is-multifield .prompt-meaning {
+    margin: 9px 0 5px;
+    line-height: 1.3;
+  }
+
   .soft-keyboard {
     position: relative;
     z-index: 2;
     width: calc(100vw - 12px);
     margin-left: calc(50% - 50vw + 6px);
-    margin-bottom: -38px;
-    padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+    margin-bottom: 0;
+    padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px));
     border-radius: 20px 20px 14px 14px;
     border-color: rgba(214, 203, 181, 0.9);
     background: rgba(255, 253, 247, 0.96);
@@ -2909,28 +2918,28 @@ svg {
 
 .sk-row {
   display: flex;
-  gap: 5px;
+  gap: 3px;
 }
 
 .sk-row + .sk-row {
-  margin-top: 5px;
+  margin-top: 3px;
 }
 
 .sk-key {
   flex: 1;
   min-width: 0;
-  min-height: 43px;
+  min-height: 40px;
   padding: 0;
-  border: 1px solid var(--line-strong);
-  border-radius: 9px;
+  border: 1px solid rgba(203, 192, 170, 0.7);
+  border-radius: 8px;
   background: #fffefa;
   color: var(--ink);
   font-family: var(--font-sans);
   font-size: 16px;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1;
-  box-shadow: 0 2px 0 rgba(126, 113, 90, 0.18);
-  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.08s ease;
+  box-shadow: none;
+  transition: transform 0.08s ease, background 0.08s ease;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -2946,21 +2955,24 @@ svg {
   font-size: 12px;
 }
 
+.sk-key.backspace { flex: 1.2; }
+
 .sk-key.wide {
-  flex: 1.7;
+  flex: 2.4;
 }
 
 .sk-key.submit {
   background: var(--accent);
   border-color: var(--accent);
   color: #fbf8ef;
-  font-size: 13px;
+  font-size: 15px;
+  font-weight: 700;
 }
 
 @media (max-width: 380px) {
-  .soft-keyboard { padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px)); }
-  .sk-row { gap: 4px; }
-  .sk-row + .sk-row { margin-top: 4px; }
+  .soft-keyboard { padding: 5px 5px calc(5px + env(safe-area-inset-bottom, 0px)); }
+  .sk-row { gap: 3px; }
+  .sk-row + .sk-row { margin-top: 3px; }
   .sk-key { min-height: 40px; font-size: 15px; }
   .sk-key.special { font-size: 11px; }
 }
@@ -2968,7 +2980,15 @@ svg {
 .answer-row {
   display: flex;
   gap: 8px;
-  margin-top: 10px;
+  margin-top: 6px;
+}
+
+/* 提示 / 不会 两个按钮压矮一点，给内置键盘留出完整空间。 */
+.answer-row .ghost-btn {
+  min-height: 36px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  font-size: 13px;
 }
 
 .answer-row .primary-btn {
@@ -2991,8 +3011,8 @@ svg {
 }
 
 .hint-text {
-  margin-top: 9px;
-  min-height: 18px;
+  margin-top: 5px;
+  min-height: 14px;
   color: var(--amber-deep);
   font-size: 11px;
   text-align: center;
@@ -4766,26 +4786,30 @@ body.sheet-open {
   font-size: 12px;
 }
 
-/* 多行听写卡片：第一行原词，下面按词性一行一个变形 */
+/* 多行听写卡片：缩写行名在左，输入框在右，紧凑排列 */
 .dict-fields {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-top: 14px;
+  gap: 6px;
+  margin-top: 10px;
 }
 
 .dict-field {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .dict-field-label {
-  flex: 0 0 120px;
+  flex: 0 0 38px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--card-soft);
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.35;
-  text-align: left;
+  font-size: 10px;
+  line-height: 1.15;
+  text-align: center;
+  white-space: nowrap;
 }
 
 .dict-field.is-base .dict-field-label {
@@ -4796,14 +4820,15 @@ body.sheet-open {
 .dict-input {
   flex: 1 1 auto;
   min-width: 0;
-  height: 46px;
-  padding: 0 12px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0 9px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
   background: var(--card);
   color: var(--ink);
   font-family: var(--font-serif);
-  font-size: 17px;
+  font-size: 16px;
   text-align: left;
   box-shadow: none;
 }
@@ -4814,37 +4839,26 @@ body.sheet-open {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-.dict-group {
-  margin-top: 4px;
-  padding: 10px 11px 12px;
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-md);
-  background: var(--card-soft);
-}
-
-.dict-group-title {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin-bottom: 9px;
-  color: var(--ink-soft);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.dict-pos {
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: var(--accent-soft);
-  color: var(--accent-deep);
-  font-size: 10px;
-}
-
-/* 过去式/过去分词、比较级/最高级：左边统一行名，右边两个空并排 */
+/* 过去式/过去分词、比较级/最高级：左侧上下两个缩写，右侧两个空并排 */
 .dict-line.is-pair {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 7px;
+}
+
+.dict-pair-labels {
+  flex: 0 0 38px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+/* 竖排时 flex-basis 是高度：必须盖掉 .dict-field-label 的 38px，否则两个小标签会把整行撑成两行高。 */
+.dict-pair-labels .dict-field-label {
+  flex: 0 0 auto;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .dict-pair-fields {
@@ -4852,11 +4866,10 @@ body.sheet-open {
   min-width: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 6px;
 }
 
 .dict-pair-fields .dict-input {
-  /* 只补 grid 里的宽度，高度/字号/边框全部继承 .dict-input，和其它空完全一致 */
   width: 100%;
 }
 

@@ -1,5 +1,5 @@
 /* 词听 offline cache */
-const CACHE = "citing-v2.0.8";
+const CACHE = "citing-v2.0.11";
 const CORE = [
   "./",
   "./index.html",
