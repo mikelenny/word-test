@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "2.0.11";
+  const APP_VERSION = "2.0.15";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -1269,12 +1269,14 @@
   };
   const FORM_POS_ORDER = ["v.", "n.", "adj.", "adv."];
   // 手机空间紧：卡片上的行名用缩写，反馈页仍显示完整中文名。
+  // 语言学界通用缩写：pos.=positive（原级），past=past tense，p.p.=past participle，
+  // pres.=present participle，sg.=third person singular，pl.=plural，comp./sup.=comparative/superlative。
   const FORM_SHORT_LABELS = {
     "原词": "pos.",
     "过去式": "past",
-    "过去分词": "pp.",
-    "现在分词": "ing.",
-    "第三人称单数": "3rd",
+    "过去分词": "p.p.",
+    "现在分词": "pres.",
+    "第三人称单数": "sg.",
     "复数": "pl.",
     "比较级": "comp.",
     "最高级": "sup.",
@@ -6582,21 +6584,51 @@
       <div class="soft-keyboard" id="softKeyboard" aria-label="内置英文键盘">
         ${rows.map((row, index) => `
           <div class="sk-row">
+            ${index === 2 ? '<span class="sk-spacer" aria-hidden="true"></span>' : ""}
             ${Array.from(row).map((letter) => `<button class="sk-key" type="button" data-key="${letter}">${letter}</button>`).join("")}
             ${index === 2 ? '<button class="sk-key special backspace" type="button" data-key="backspace" aria-label="删除一个字母">⌫</button>' : ""}
           </div>`).join("")}
         <div class="sk-row">
           <button class="sk-key special" type="button" data-key="'">'</button>
           <button class="sk-key special" type="button" data-key="-">-</button>
-          <button class="sk-key special wide" type="button" data-key="space">空格</button>
+          <button class="sk-key special wide space" type="button" data-key="space">空格</button>
           <button class="sk-key special wide submit" type="button" data-key="submit">提交</button>
         </div>
       </div>`;
   }
 
+  // 轻震动反馈：不支持的浏览器（如 iOS Safari）静默跳过。
+  function buzz(ms = 12) {
+    try { if (navigator.vibrate) navigator.vibrate(ms); } catch (error) { /* ignore */ }
+  }
+
+  // 提交/看完答案后收起键盘，下一题 renderSession 会重新画出来。
+  function hideSoftKeyboard() {
+    const keyboard = $("#softKeyboard");
+    if (keyboard) keyboard.remove();
+    const body = $("#sessionBody");
+    if (body) body.classList.remove("has-soft-keyboard");
+    stopBackspaceRepeat();
+  }
+
+  let backspaceDelayTimer = null;
+  let backspaceRepeatTimer = null;
+  function stopBackspaceRepeat() {
+    if (backspaceDelayTimer) { clearTimeout(backspaceDelayTimer); backspaceDelayTimer = null; }
+    if (backspaceRepeatTimer) { clearInterval(backspaceRepeatTimer); backspaceRepeatTimer = null; }
+  }
+
+  // 软键盘改的是 input.value，浏览器不会像真键盘那样自动把末尾滚进视野；
+  // 手动把 scrollLeft 推到最右，输入超过框宽时始终显示最后敲的那个字母。
+  function keepInputEndVisible(input) {
+    if (!input) return;
+    try { input.scrollLeft = input.scrollWidth; } catch (error) { /* ignore */ }
+  }
+
   function pressSoftKey(key) {
     const session = ui.session;
     if (!session || session.answered || session.mode === "en2zh") return;
+    buzz(key === "backspace" ? 8 : 12);
     // 手机内置键盘：点按键时按钮会抢走焦点，所以用 focusin/pointerdown 记下最近点的输入框。
     const focused = ui.activeSoftInput;
     const active = focused && focused.isConnected && !focused.disabled
@@ -6613,14 +6645,17 @@
     }
     if (key === "backspace") {
       input.value = input.value.slice(0, -1);
+      keepInputEndVisible(input);
       return;
     }
     if (key === "space") {
       if (input.value && !input.value.endsWith(" ")) input.value += " ";
+      keepInputEndVisible(input);
       return;
     }
     if (input.value.length >= 48) return;
     input.value += key;
+    keepInputEndVisible(input);
   }
 
   function questionTagsHTML(item) {
@@ -6942,6 +6977,7 @@
 
   function renderSession(shouldSpeak = false) {
     const session = ui.session;
+    stopBackspaceRepeat();
     if (!session) return;
     if (session.index >= session.queue.length) {
       advanceRound();
@@ -6960,14 +6996,20 @@
     session.hintUsed = false;
     const body = $("#sessionBody");
     body.innerHTML = `${roundNoticeHTML(session)}${questionHTML(item)}`;
+    // 内置键盘在手机上固定在屏幕底部，给滚动区留出等高的空间，避免遮住最后一行。
+    body.classList.toggle("has-soft-keyboard", Boolean($(".soft-keyboard", body)));
     // 「只写原词」和多行听写来回切时，已经写进去的内容不能丢。
     if (isMultiFieldItem(item) && Array.isArray(item.draftFields)) {
       $$("[data-field]", body).forEach((field, index) => {
         field.value = item.draftFields[index] || "";
+        keepInputEndVisible(field);
       });
     } else if (typeof item.draftAnswer === "string") {
       const answer = $("#answerInput");
-      if (answer) answer.value = item.draftAnswer;
+      if (answer) {
+        answer.value = item.draftAnswer;
+        keepInputEndVisible(answer);
+      }
     }
     session.showRoundNotice = false;
     body.scrollTop = 0;
@@ -7088,6 +7130,7 @@
       const targets = [item.word.w].concat(itemFormLines(item).map((line) => line.target));
       fields.forEach((field, index) => {
         field.value = targets[index] || "";
+        keepInputEndVisible(field);
         field.disabled = true;
       });
       handleAnswer(false, "", null, true);
@@ -7097,6 +7140,7 @@
     const input = $("#answerInput");
     if (input) {
       input.value = target;
+      keepInputEndVisible(input);
       input.disabled = true;
     }
     handleAnswer(false, "", null, true);
@@ -7110,6 +7154,8 @@
     const bookId = item.bookId || session.bookId;
 
     session.answered = true;
+    // 一答完就收起内置键盘，露出反馈；下一题会再出现。
+    hideSoftKeyboard();
     session.selectedIndex = selectedIndex;
     session.attempts += 1;
     session.done = (session.done || 0) + 1;
@@ -7965,8 +8011,37 @@
         ui.activeSoftInput = input;
         input.focus({ preventScroll: true });
       }
+      // 按键在 pointerdown 当下就生效，不等 click：快速连点不会丢键。
+      const key = event.target && event.target.closest ? event.target.closest("[data-key]") : null;
+      if (key) {
+        if (event.button && event.button !== 0) return;
+        event.preventDefault(); // 不让按钮抢焦点，也别等 click 合成
+        pressSoftKey(key.dataset.key);
+        if (key.dataset.key === "backspace") {
+          stopBackspaceRepeat();
+          backspaceDelayTimer = setTimeout(() => {
+            backspaceRepeatTimer = setInterval(() => {
+              const active = ui.activeSoftInput && ui.activeSoftInput.isConnected
+                ? ui.activeSoftInput
+                : $("[data-field]", $("#sessionBody"));
+              if (!active || !active.value) return;
+              active.value = active.value.slice(0, -1);
+              keepInputEndVisible(active);
+              buzz(8);
+            }, 70);
+          }, 360);
+        }
+      }
     });
+    document.addEventListener("pointerup", stopBackspaceRepeat);
+    document.addEventListener("pointercancel", stopBackspaceRepeat);
     $("#sessionBody").addEventListener("mousedown", (event) => {
+      if (event.target && event.target.closest && event.target.closest("[data-key]")) {
+        event.preventDefault();
+      }
+    });
+    // 长按删除键时别弹出系统文字选择菜单。
+    $("#sessionBody").addEventListener("contextmenu", (event) => {
       if (event.target && event.target.closest && event.target.closest("[data-key]")) {
         event.preventDefault();
       }
@@ -8017,12 +8092,7 @@
         nextQuestion();
         return;
       }
-      const softKey = target.closest("[data-key]");
-      if (softKey) {
-        event.preventDefault();
-        pressSoftKey(softKey.dataset.key);
-        return;
-      }
+      // 软键盘已在 pointerdown 里处理，click 不再重复响应。
       const option = target.closest("[data-option]");
       if (option) {
         chooseOption(parseInt(option.dataset.option, 10));
