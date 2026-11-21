@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.8.1";
+  const APP_VERSION = "2.0.8";
   const STORAGE_KEY = "citing.state.v1";
   const UPLOAD_KEY = "citing.upload.v1";
   const UPLOAD_BOOK_ID = "upload";
@@ -66,6 +66,7 @@
   const MODE_LABEL = {
     zh2en: "看中文写英文",
     en2zh: "看英文选中文",
+    form: "词形变化",
   };
 
   const SPELLING_PAIRS = [
@@ -154,10 +155,15 @@
     manageBookId: "",
     uploadTargetId: "",
     manualTargetId: "",
+    swUpdating: false,
+    swReloadPending: false,
     wrongSelected: new Set(),
     wrongScope: "",
     importDraft: null,
   };
+
+  // 词形变化结果缓存：同一个词 + 同一份释义只算一次。
+  const MORPH_CACHE = new Map();
 
   let store = loadStore();
 
@@ -481,6 +487,8 @@
       settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
       settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
       settings.personalTargetId = typeof settings.personalTargetId === "string" ? settings.personalTargetId : "";
+      settings.wrongSort = ["time", "alpha", "count"].includes(settings.wrongSort) ? settings.wrongSort : "time";
+      if (typeof settings.dictateForms !== "boolean") settings.dictateForms = true;
       return {
         version: 1,
         settings,
@@ -512,6 +520,8 @@
         soundVolume: 1.5,
         ranges: {},
         personalTargetId: "",
+        wrongSort: "time",
+        dictateForms: true,
         installHintDismissed: false,
       },
       progress: {},
@@ -1176,6 +1186,200 @@
     return null;
   }
 
+  /* ---------------- 词形变化 ---------------- */
+  // 词条的释义里如果带词性标注，就直接用来判断动词/形容词/名词；
+  // 上传或导入的词条常常没有释义，这时回落到离线词典里的同名词条。
+  function morphMeaning(word, meaning) {
+    const text = String(meaning || "");
+    if (/(?:^|[\s（(,，、;；/&+])(?:n|v|vt|vi|adj|adv|ad|a)\./i.test(text)) return text;
+    const row = state.dict && state.dict[word];
+    if (row && row[1]) return row[1];
+    return text;
+  }
+
+  function morphForms(word, meaning, options = {}) {
+    if (!window.WordMorph) return [];
+    const base = String(word || "").toLowerCase();
+    if (!base) return [];
+    const source = morphMeaning(base, meaning);
+    const key = `${base}|${source}${options.keepDuplicates ? "|all" : ""}${options.keepPairs ? "|pairs" : ""}`;
+    if (MORPH_CACHE.has(key)) return MORPH_CACHE.get(key);
+    let list = [];
+    try {
+      list = window.WordMorph.forms(base, source, options) || [];
+    } catch (error) {
+      list = [];
+    }
+    MORPH_CACHE.set(key, list);
+    return list;
+  }
+
+  function practiceForms(word, meaning, options = {}) {
+    return morphForms(word, meaning, options).filter((form) => {
+      const pool = [form.value, ...(form.alt || [])].map((item) => item.toLowerCase().trim());
+      return pool.every((item) => item !== String(word || "").toLowerCase());
+    });
+  }
+
+  // 听写时只顺带考「特殊变化」：加 -ed / -s / -er 这类按规则来的看一眼就会，
+  // pay→paid、good→best、child→children 这种不规则的才值得多占一道题。
+  function dictatedForms(word, meaning) {
+    return practiceForms(word, meaning).filter((form) => form.irregular);
+  }
+
+  // 设置页的自检数字：这一本词库里到底有多少词能出特殊变形。
+  // 没有它的话，「开关开着但今天这批词恰好没有不规则词」很容易被当成功能坏了。
+  const FORM_STATS_CACHE = new Map();
+  function bookFormStats(book) {
+    if (!book || !Array.isArray(book.words)) return { words: 0, forms: 0 };
+    const key = `${book.id}|${book.words.length}`;
+    if (FORM_STATS_CACHE.has(key)) return FORM_STATS_CACHE.get(key);
+    let words = 0;
+    let forms = 0;
+    for (const entry of book.words) {
+      const list = dictatedForms(entry.w, entry.m);
+      if (!list.length) continue;
+      words += 1;
+      forms += list.length;
+    }
+    const stats = { words, forms };
+    FORM_STATS_CACHE.set(key, stats);
+    return stats;
+  }
+
+  // 词典里不少词条把过去式/过去分词直接写在释义最前面，例如 find 的
+  // "(found, found) vt. 找到…"。听写时这等于把答案印在题面上，先抹掉。
+  function cleanDictationMeaning(meaning) {
+    return String(meaning || "")
+      .replace(/^\(\s*[a-zA-Z]+(?:\s*[,，/、]\s*[a-zA-Z]+)*\s*\)\s*/, "")
+      .trim();
+  }
+
+  // 变形按词性分组：动词（过去式/过去分词/现在分词/三单）、名词（复数）、
+  // 形容词（比较级/最高级）、副词。和独立 form 模式不同，这里规则变化也一起写。
+  const FORM_POS_META = {
+    past: { pos: "v.", label: "动词" },
+    pp: { pos: "v.", label: "动词" },
+    ing: { pos: "v.", label: "动词" },
+    third: { pos: "v.", label: "动词" },
+    plural: { pos: "n.", label: "名词" },
+    comp: { pos: "adj.", label: "形容词" },
+    sup: { pos: "adj.", label: "形容词" },
+    adv: { pos: "adv.", label: "副词" },
+  };
+  const FORM_POS_ORDER = ["v.", "n.", "adj.", "adv."];
+
+  // 同一行里可以放两个空：过去式 / 过去分词、比较级 / 最高级。
+  // 这样 pay→paid / paid 和 do→did / done 都能让学生自己判断两者是否同形。
+  const FORM_PAIRS = [
+    { first: "past", second: "pp", label: "过去式 / 过去分词" },
+    { first: "comp", second: "sup", label: "比较级 / 最高级" },
+  ];
+
+  function dictationFormGroups(entry) {
+    if (!entry || !entry.w) return [];
+    const groups = new Map();
+    // 听写卡片按词性分组，跨词性同形（study 的三单/复数都是 studies）也要各占一行。
+    // keepPairs 让同形的过去式和过去分词各留一个空，不在词形层合并。
+    for (const form of practiceForms(entry.w, entry.m, { keepDuplicates: true, keepPairs: true })) {
+      const meta = FORM_POS_META[form.key];
+      if (!meta) continue;
+      if (!groups.has(meta.pos)) groups.set(meta.pos, { pos: meta.pos, label: meta.label, lines: [] });
+      groups.get(meta.pos).lines.push({
+        label: form.label,
+        target: form.value,
+        alt: form.alt || [],
+        form,
+        cells: [{ label: form.label, target: form.value, alt: form.alt || [], form }],
+      });
+    }
+    for (const group of groups.values()) {
+      for (const pair of FORM_PAIRS) {
+        const first = group.lines.find((line) => line.form.key === pair.first);
+        const second = group.lines.find((line) => line.form.key === pair.second);
+        if (!first || !second) continue;
+        first.cells = [
+          { label: first.form.label, target: first.form.value, alt: first.alt, form: first.form },
+          { label: second.form.label, target: second.form.value, alt: second.alt, form: second.form },
+        ];
+        first.label = pair.label;
+        group.lines.splice(group.lines.indexOf(second), 1);
+      }
+    }
+    return FORM_POS_ORDER.filter((pos) => groups.has(pos)).map((pos) => groups.get(pos));
+  }
+
+  // 摊平成输入框序列：一行两空会返回两个 cell，顺序和卡片里的 [data-field] 一致。
+  function itemFormLines(item) {
+    if (!item || !Array.isArray(item.formGroups) || item.skipForms) return [];
+    return item.formGroups.reduce(
+      (out, group) => out.concat(
+        group.lines.reduce((cells, line) => cells.concat(
+          line.cells || [{ label: line.label, target: line.target, alt: line.alt, form: line.form }]
+        ), []).map((cell) => ({ ...cell, pos: group.pos, posLabel: group.label }))
+      ),
+      []
+    );
+  }
+
+  function isMultiFieldItem(item) {
+    return Boolean(item && item.word && !item.form && !item.skipForms
+      && Array.isArray(item.formGroups) && item.formGroups.length);
+  }
+
+  // 听写队列不再把一个词的变形拆成多道题：一道题里原词一行，变形按词性跟在下面。
+  // formGroups 始终保留，「只写原词」只是临时收起，随时能切回多行听写。
+  function expandFormItems(items) {
+    for (const item of items) {
+      if (item.form || !item.word) continue;
+      item.formGroups = dictationFormGroups(item.word);
+    }
+    return items;
+  }
+
+  function formValueHTML(form) {
+    const alt = form.alt && form.alt.length ? ` / ${form.alt.map((item) => esc(item)).join(" / ")}` : "";
+    return `${esc(form.value)}${alt}`;
+  }
+
+  function morphBlockHTML(word, meaning, options = {}) {
+    const list = morphForms(word, meaning);
+    if (!list.length) return "";
+    const special = list.some((form) => form.irregular);
+    const rows = list.map((form) => `
+      <span class="morph-item${form.irregular ? " is-irregular" : ""}">
+        <em>${esc(form.label)}</em>
+        <strong>${formValueHTML(form)}</strong>
+      </span>`).join("");
+    return `
+      <div class="morph-block">
+        <div class="morph-head">
+          <strong>词形变化</strong>
+          <small>${special ? "红色是需要单独记的特殊变化" : "按规则推导"}</small>
+        </div>
+        <div class="morph-grid">${rows}</div>
+        ${options.practice === false ? "" : `<button class="morph-practice" type="button" data-practice-forms="${escAttr(word)}">${ICONS.pencil} 练这几个变形</button>`}
+      </div>`;
+  }
+
+  function morphLineHTML(word, meaning) {
+    const list = morphForms(word, meaning);
+    if (!list.length) return "";
+    const text = list
+      .map((form) => `${form.label} ${form.value}${form.alt && form.alt.length ? `/${form.alt.join("/")}` : ""}`)
+      .join(" · ");
+    return `<div class="morph-line"><span>变形</span>${esc(text)}</div>`;
+  }
+
+  // 变形题的判定：主写法和不规则表里的另一种写法都算对。
+  function isCorrectFormAnswer(input, form) {
+    if (!form) return false;
+    const value = normalizeAnswer(input);
+    if (!value) return false;
+    const pool = [form.value, ...(form.alt || [])];
+    return pool.some((item) => normalizeAnswer(item) === value);
+  }
+
   function findBookEntry(word) {
     const bases = lemmaCandidates(word);
     const ordered = [];
@@ -1769,8 +1973,20 @@
           </span>
           <small>四选一 · 快速识词</small>
         </button>
+        <button class="mode-card form" type="button" data-mode="form">
+          <span class="mode-head">
+            <span class="mode-icon">${ICONS.refresh}</span>
+            <strong>词形变化</strong>
+          </span>
+          <small>good → better · go → went</small>
+        </button>
       </div>
       <p class="mode-note">每天 ${target} 个新词 · 错词自动重复出现</p>
+      <button type="button" class="forms-flag ${store.settings.dictateForms !== false ? "is-on" : "is-off"}"
+        data-toggle="dictateForms" aria-pressed="${store.settings.dictateForms !== false}">
+        <span class="forms-flag-dot" aria-hidden="true"></span>
+        ${store.settings.dictateForms !== false ? "听写顺带特殊变形 · 已开启" : "听写顺带特殊变形 · 已关闭，点此开启"}
+      </button>
 
       ${wrong.length ? `
         <div class="wrong-teaser">
@@ -2029,6 +2245,14 @@
       return `<div class="wrong-attempt"><span class="wrong-attempt-label">上次直接看了答案</span></div>`;
     }
     const input = String(wrong.input || "").trim();
+    // 变形题（无论是「词形变化」模式还是听写里顺带考的）都记了 expected。
+    if (wrong.expected) {
+      return `<div class="wrong-attempt">
+          <span class="wrong-attempt-label">${esc(wrong.label || "变形")}</span>
+          <strong class="wrong-attempt-right">${esc(wrong.expected)}</strong>
+          ${input ? `<span class="wrong-attempt-arrow">·</span><span class="wrong-attempt-label">上次写成</span>${spellDiffHTML(input, wrong.expected)}` : ""}
+        </div>`;
+    }
     if (!input) return "";
     if (wrong.mode === "en2zh") {
       return `<div class="wrong-attempt">
@@ -2102,10 +2326,38 @@
     return { w: word, p: "", m: "暂无释义" };
   }
 
+  const WRONG_SORTS = [
+    { id: "time", label: "最近出错" },
+    { id: "alpha", label: "字母" },
+    { id: "count", label: "错误次数" },
+  ];
+
+  function wrongTimeOf(row) {
+    const item = (row && row.item) || {};
+    return Number((item.lastWrong && item.lastWrong.at) || item.last || item.firstSeen || 0);
+  }
+
+  // 错词排序：默认最近出错在前，也可以按字母或按错了多少次。
   function wrongSort(a, b) {
-    return (a.item.due || 0) - (b.item.due || 0)
+    const mode = store.settings.wrongSort;
+    if (mode === "alpha") {
+      return a.entry.w.localeCompare(b.entry.w) || wrongTimeOf(b) - wrongTimeOf(a);
+    }
+    if (mode === "count") {
+      return (b.item.wrongCount || 0) - (a.item.wrongCount || 0)
+        || wrongTimeOf(b) - wrongTimeOf(a)
+        || a.entry.w.localeCompare(b.entry.w);
+    }
+    return wrongTimeOf(b) - wrongTimeOf(a)
       || (b.item.wrongCount || 0) - (a.item.wrongCount || 0)
-      || (b.item.last || 0) - (a.item.last || 0);
+      || a.entry.w.localeCompare(b.entry.w);
+  }
+
+  function wrongSortChipsHTML() {
+    const chips = WRONG_SORTS.map((sort) => `
+      <button class="wrong-sort ${store.settings.wrongSort === sort.id ? "is-active" : ""}" type="button"
+        data-wrong-sort="${sort.id}" aria-pressed="${store.settings.wrongSort === sort.id}">${sort.label}</button>`).join("");
+    return `<div class="wrong-sorts"><span class="wrong-sorts-label">排序</span>${chips}</div>`;
   }
 
   // 某一本的错词。词库还没加载时用离线词典兜底，保证列表不空。
@@ -2237,6 +2489,7 @@
 
     $("#view").innerHTML = `
       ${head}
+      ${wrongSortChipsHTML()}
       <div class="wrong-actions">
         <button class="primary-btn" type="button" data-wrong-mode="zh2en">写英文复习</button>
         <button class="ghost-btn" type="button" data-wrong-mode="en2zh">选中文</button>
@@ -2401,6 +2654,13 @@
           <div class="setting-copy"><strong>自动发音</strong><small>每道题出现时自动读一遍单词</small></div>
           <button type="button" class="switch ${store.settings.autoSpeak ? "is-on" : ""}" role="switch" aria-checked="${store.settings.autoSpeak}" data-toggle="autoSpeak" aria-label="自动发音"></button>
         </div>
+        <div class="setting-row">
+          <div class="setting-copy">
+            <strong>听写特殊变形${store.settings.dictateForms === false ? "（已关闭）" : ""}</strong>
+            <small>开启后听写 pay 会接着考 paid，只加不规则的过去式、复数、比较级。当前词库 ${bookFormStats(currentBook()).words} 个词共 ${bookFormStats(currentBook()).forms} 条特殊变形</small>
+          </div>
+          <button type="button" class="switch ${store.settings.dictateForms !== false ? "is-on" : ""}" role="switch" aria-checked="${store.settings.dictateForms !== false}" data-toggle="dictateForms" aria-label="听写特殊变形"></button>
+        </div>
       </div>
 
       <div class="settings-group">
@@ -2492,8 +2752,11 @@
           </div>
         </div>
         <div class="setting-row">
-          <div class="setting-copy"><strong>检查更新</strong><small>有新版本时，重新打开即可</small></div>
-          <button class="mini-btn" type="button" data-action="update">${ICONS.refresh} 检查</button>
+          <div class="setting-copy"><strong>检查更新</strong><small>${ui.swReloadPending ? "新版本已就绪，这一组练完自动刷新" : "发现新版本会自动刷新，不用手动重开"}</small></div>
+          <div class="data-actions">
+            <button class="mini-btn" type="button" data-action="update">${ICONS.refresh} 检查</button>
+            <button class="mini-btn" type="button" data-action="hard-reload">强制重载</button>
+          </div>
         </div>
       </div>
 
@@ -3207,6 +3470,7 @@
     settings.soundVolume = [0.7, 1, 1.5].includes(Number(settings.soundVolume)) ? Number(settings.soundVolume) : 1.5;
     settings.ranges = settings.ranges && typeof settings.ranges === "object" ? settings.ranges : {};
     settings.personalTargetId = typeof settings.personalTargetId === "string" ? settings.personalTargetId : "";
+    if (typeof settings.dictateForms !== "boolean") settings.dictateForms = true;
     return {
       version: 1,
       settings,
@@ -3229,6 +3493,28 @@
     }
   }
 
+  // 等新 worker 出现（最多 timeout 毫秒）；没有就说明已经是最新版。
+  async function waitForUpdateWorker(registration, timeout) {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      if (registration.waiting) return registration.waiting;
+      const installing = registration.installing;
+      if (installing) {
+        if (installing.state === "installed") return installing;
+        await new Promise((resolve) => {
+          const done = () => {
+            if (installing.state === "installed" || installing.state === "redundant") resolve();
+          };
+          installing.addEventListener("statechange", done);
+          setTimeout(resolve, 1500);
+        });
+        if (installing.state === "installed") return installing;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    return null;
+  }
+
   async function checkUpdate() {
     if (!("serviceWorker" in navigator) || location.protocol === "file:") {
       toast("当前不是网页安装版，无法检查更新");
@@ -3240,11 +3526,36 @@
         toast("离线缓存还没有准备好");
         return;
       }
-      await registration.update();
-      toast("已检查更新；有新版本时重新打开即可");
+      toast("正在检查更新…");
+      await registration.update().catch(() => {});
+      const worker = await waitForUpdateWorker(registration, 4000);
+      if (worker) {
+        toast("发现新版本，正在更新…");
+        if (navigator.serviceWorker.controller) {
+          worker.postMessage({ type: "SKIP_WAITING" });
+        } else {
+          applyPendingUpdate();
+        }
+        return;
+      }
+      toast(`已是最新版本 v${APP_VERSION}`);
     } catch (error) {
       toast("检查更新失败，请稍后再试", true);
     }
+  }
+
+  // 兜底：注销 SW、清掉所有缓存再重新加载。学习记录在 localStorage 里，不受影响。
+  async function hardReload() {
+    if (!window.confirm("清掉离线缓存并重新加载？学习记录不会丢，但重新加载后要联网重新缓存词库。")) return;
+    try {
+      const registration = await navigator.serviceWorker.getRegistration();
+      if (registration) await registration.unregister();
+      const keys = await caches.keys();
+      await Promise.all(keys.map((key) => caches.delete(key)));
+    } catch (error) {
+      console.warn("Hard reload cleanup failed", error);
+    }
+    location.reload();
   }
 
   /* ---------------- book & range sheets ---------------- */
@@ -5227,6 +5538,7 @@
         <button class="audio-btn" type="button" data-speak="${escAttr(query)}">${ICONS.speaker} 朗读</button>
       </div>
       <div class="lookup-meaning">${posMeaning(result.meaning)}</div>
+      ${morphBlockHTML(result.base, result.meaning)}
       ${!exact ? `<div class="lookup-note">这个词的原形是 <strong>${esc(result.base)}</strong>，释义和音标按原形显示。</div>` : ""}
       ${example ? `
         <div class="lookup-example">
@@ -5920,6 +6232,8 @@
   function openHandwriting() {
     const session = ui.session;
     if (!session || session.answered || session.mode !== "zh2en") return;
+    // 变形题可能是多词形态（more beautiful），格子系统装不下，只保留键盘输入。
+    if (session.queue[session.index].form) return;
     const entry = session.queue[session.index].word;
     const letterCount = entry.w.replace(/[^a-z]/gi, "").length;
     openSheet(`
@@ -6010,6 +6324,54 @@
     return picked.map((entry) => ({ word: entry, isNew: !progress[entry.w] }));
   }
 
+  // 变形练习：优先挑学过的、错过的、带特殊变化的词；每个词抽一个变形来考。
+  const FORM_LIMIT = 12;
+
+  function formQueue(book, limit = FORM_LIMIT) {
+    const progress = progressFor(book.id);
+    const pool = [];
+    for (const entry of rangeWords(book)) {
+      const forms = practiceForms(entry.w, entry.m);
+      if (!forms.length) continue;
+      const record = progress[entry.w];
+      let score = 0;
+      if (record) score += 3;
+      if (record && (record.wrongCount || 0) > 0 && !record.mastered) score += 3;
+      if (forms.some((form) => form.irregular)) score += 2;
+      pool.push({ entry, forms, score });
+    }
+    if (!pool.length) return [];
+    const shuffled = shuffle(pool);
+    shuffled.sort((a, b) => b.score - a.score);
+    return shuffled.slice(0, limit).map(({ entry, forms }) => {
+      const special = forms.filter((form) => form.irregular);
+      const pickFrom = special.length && Math.random() < 0.8 ? special : forms;
+      const form = pickFrom[Math.floor(Math.random() * pickFrom.length)];
+      return { word: entry, isNew: false, form };
+    });
+  }
+
+  // 查词页的「练这几个变形」：把这个词的每个变形都做成一道题。
+  async function startFormPractice(word, entry) {
+    const base = String(word || "").toLowerCase();
+    const meaning = entry && entry.m ? entry.m : ((state.dict && state.dict[base] && state.dict[base][1]) || "");
+    const forms = practiceForms(base, meaning);
+    if (!forms.length) {
+      toast("这个词暂时没有可练的变形");
+      return;
+    }
+    const book = currentBook();
+    const target = entry || {
+      w: base,
+      p: (state.dict && state.dict[base] && state.dict[base][0]) || "",
+      m: meaning || "暂无释义",
+    };
+    closeSheet();
+    await startSession("form", {
+      items: forms.map((form) => ({ entry: target, bookId: book ? book.id : "", form })),
+    });
+  }
+
   async function startSession(mode, options = {}) {
     let book = currentBook();
     if (!book) {
@@ -6022,25 +6384,40 @@
       }
     }
     if (!book) return;
-    if (mode !== "zh2en" && mode !== "en2zh") mode = "zh2en";
+    if (!["zh2en", "en2zh", "form"].includes(mode)) mode = "zh2en";
+    // 听写（看中文写英文）时顺带考不规则变形；选择题没有对应题型，不加。
+    const useForms = mode === "zh2en" && store.settings.dictateForms !== false;
+    const expand = (items) => (useForms ? expandFormItems(items) : items);
 
     let rounds = [];
     if (Array.isArray(options.items) && options.items.length) {
       // 跨词库练习（例如「所有错词」）：每条自带所属词库，进度写回各自那一本。
-      rounds = [{
-        key: "single",
-        items: options.items.map(({ entry, bookId }) => ({ word: entry, isNew: false, bookId: bookId || book.id })),
-      }];
+      const singleItems = options.items.map(({ entry, bookId, form, formGroups, skipForms }) => ({
+        word: entry,
+        isNew: false,
+        bookId: bookId || book.id,
+        form,
+        formGroups,
+        skipForms,
+      }));
+      rounds = [{ key: "single", items: useForms ? expandFormItems(singleItems) : singleItems }];
     } else if (Array.isArray(options.entries) && options.entries.length) {
       rounds = [{
         key: "single",
-        items: arrangeRelated(options.entries, book).map((entry) => ({ word: entry, isNew: false })),
+        items: expand(arrangeRelated(options.entries, book).map((entry) => ({ word: entry, isNew: false }))),
       }];
     } else if (options.source === "wrong") {
       const entries = wrongEntries(book).slice(0, 30).map(({ entry }) => entry);
       rounds = [{ key: "single", items: arrangeRelated(entries, book).map((entry) => ({ word: entry, isNew: false })) }];
+    } else if (mode === "form" || options.source === "form") {
+      const items = formQueue(book);
+      if (!items.length) {
+        toast("当前范围还没有可以练的变形，换个词库试试");
+        return;
+      }
+      rounds = [{ key: "single", items }];
     } else if (options.source === "free") {
-      rounds = [{ key: "free", items: pickFreeQueue(book) }];
+      rounds = [{ key: "free", items: expand(pickFreeQueue(book)) }];
     } else {
       // 每天的主流程：第 1 轮新词、第 2 轮错词（练完才生成）、第 3 轮复习。
       let plan = dailyPlan(book);
@@ -6053,15 +6430,15 @@
         }
       }
       if (plan.fresh.length) {
-        rounds.push({ key: "new", items: plan.fresh.map((entry) => ({ word: entry, isNew: true })) });
+        rounds.push({ key: "new", items: expand(plan.fresh.map((entry) => ({ word: entry, isNew: true }))) });
       }
       // 复习量设成 0 就是「今天不复习」，连这一轮都不出现，两轮练完直接收工。
       if (plan.review.length) {
-        rounds.push({ key: "review", items: plan.review.map((entry) => ({ word: entry, isNew: false })) });
+        rounds.push({ key: "review", items: expand(plan.review.map((entry) => ({ word: entry, isNew: false }))) });
       }
       if (!rounds.length && store.settings.dailyReview > 0) {
         const free = pickFreeQueue(book);
-        if (free.length) rounds.push({ key: "free", items: free });
+        if (free.length) rounds.push({ key: "free", items: expand(free) });
       }
       if (!rounds.length) {
         toast(store.settings.dailyReview === 0
@@ -6106,6 +6483,8 @@
       finished: false,
       newCount: 0,
       wrongSet: new Set(),
+      wrongItems: [],
+      wrongKeys: new Set(),
       currentOptions: null,
       hintUsed: false,
     };
@@ -6204,8 +6583,12 @@
 
   function pressSoftKey(key) {
     const session = ui.session;
-    if (!session || session.answered || session.mode !== "zh2en") return;
-    const input = $("#answerInput");
+    if (!session || session.answered || session.mode === "en2zh") return;
+    // 多输入行时跟着当前光标走；没聚焦就落到第一行。
+    const active = document.activeElement;
+    const input = active && active.matches && active.matches("[data-field], #answerInput")
+      ? active
+      : ($("[data-field]", $("#sessionBody")) || $("#answerInput"));
     if (!input) return;
     if (key === "submit") {
       submitSpelling();
@@ -6230,24 +6613,172 @@
       ? `<span class="lib-tag lib-${escAttr(library.id)}">${esc(library.short)}</span>`
       : "";
     const newTag = item.isNew ? `<span class="new-tag">新词</span>` : "";
-    return `<span class="kicker-tags">${libraryTag}${newTag}</span>`;
+    // 听写里顺带考的变形题标一下，别让人以为题目跳词了。
+    const formTag = item.form && ui.session && ui.session.mode !== "form"
+      ? `<span class="new-tag form-tag">变形</span>`
+      : "";
+    return `<span class="kicker-tags">${libraryTag}${formTag}${newTag}</span>`;
+  }
+
+  // 拼写题的输入区（字母格、输入框、提交/提示/不会、软键盘），变形题和听写共用。
+  function spellingInputHTML(options = {}) {
+    const kb = useSoftKeyboard();
+    const slotsLabel = options.slots || "请写出变形";
+    const aria = options.aria || "输入变形后的单词";
+    const placeholder = options.placeholder || (kb ? "用下方键盘输入" : "写出这个变形");
+    return `
+            <div class="word-slots" id="wordSlots" aria-label="${escAttr(slotsLabel)}"><span class="slots-line"></span></div>
+            <input class="answer-input ${kb ? "is-soft" : ""}" id="answerInput" type="text"
+              inputmode="${kb && isTouchDevice() ? "none" : "text"}"
+              ${kb && isTouchDevice() ? "readonly" : ""}
+              autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
+              enterkeyhint="done" aria-label="${escAttr(aria)}"
+              placeholder="${escAttr(placeholder)}">
+            <div class="answer-row ${kb ? "is-soft" : ""}">
+              ${kb ? "" : '<button class="primary-btn" type="button" data-submit>提交</button>'}
+              <button class="ghost-btn" type="button" data-hint>提示</button>
+              <button class="ghost-btn reveal-btn" type="button" data-reveal>不会</button>
+            </div>
+            <div class="hint-text" id="hintText"></div>
+            ${kb ? softKeyboardHTML() : ""}`;
+  }
+
+  // 听写途中遇到的变形题：中文释义当听写提示，再点名要写哪个变形。
+  function dictationFormHTML(item) {
+    const entry = item.word;
+    const form = item.form || { label: "变形", value: "" };
+    const dictRow = state.dict && state.dict[entry.w];
+    const meaning = entry.m && entry.m !== "暂无释义"
+      ? entry.m
+      : ((dictRow && dictRow[1]) || entry.m || "");
+    return `
+        <div class="question-card">
+          <div class="question-inner">
+            <div class="question-kicker"><span>听写 · 写变形</span>${questionTagsHTML(item)}</div>
+            <div class="prompt-meaning">${meaning ? posMeaning(cleanDictationMeaning(meaning)) : "暂无释义"}</div>
+            <div class="form-ask">写出 <strong>${esc(entry.w)}</strong>${entry.p ? `<small>/${esc(entry.p)}/</small>` : ""} 的 <em>${esc(form.label)}</em></div>
+            <div class="prompt-tools">
+              <button class="audio-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker} 听原词</button>
+            </div>
+            ${spellingInputHTML({ slots: "请写出它的变形", aria: "输入变形后的单词", placeholder: "写出它的变形" })}
+          </div>
+        </div>`;
+  }
+
+  // 一张卡片写完原词和它的所有变形：第一行原词，下面按词性一行为一个变形。
+  function multiFieldDictationHTML(item) {
+    const entry = item.word;
+    const kb = useSoftKeyboard();
+    const dictRow = state.dict && state.dict[entry.w];
+    const raw = entry.m && entry.m !== "暂无释义"
+      ? entry.m
+      : ((dictRow && dictRow[1]) || entry.m || "");
+    const meaning = cleanDictationMeaning(raw);
+    const groups = item.formGroups || [];
+
+    // 原词固定 0 号，变形从 1 起；模板字符串先算 groupRows，索引不能靠调用顺序猜。
+    let fieldIndex = 1;
+    const inputHTML = (label, index) => `
+            <input class="answer-input dict-input ${kb ? "is-soft" : ""}" id="dictField${index}" data-field="${index}"
+              type="text" inputmode="${kb && isTouchDevice() ? "none" : "text"}"
+              ${kb && isTouchDevice() ? "readonly" : ""}
+              autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
+              enterkeyhint="done" aria-label="${escAttr(label)}"
+              placeholder="${kb ? "用下方键盘输入" : ""}">`;
+    const fieldHTML = (label, index, extraClass = "") => `
+          <div class="dict-field ${extraClass}">
+            <label class="dict-field-label" for="dictField${index}">${esc(label)}</label>${inputHTML(label, index)}
+          </div>`;
+
+    const lineHTML = (line) => {
+      const cells = line.cells || [{ label: line.label }];
+      if (cells.length < 2) return fieldHTML(cells[0].label, fieldIndex++);
+      // 成对变形：左边一个统一的行名，右边两个空并排，和其它行一样左对齐。
+      return `
+          <div class="dict-line is-pair">
+            <div class="dict-field-label dict-pair-label">${esc(line.label)}</div>
+            <div class="dict-pair-fields">
+              ${cells.map((cell) => inputHTML(cell.label, fieldIndex++)).join("")}
+            </div>
+          </div>`;
+    };
+
+    const groupRows = groups.map((group) => `
+          <div class="dict-group">
+            <div class="dict-group-title"><span class="dict-pos">${esc(group.pos)}</span>${esc(group.label)}</div>
+            ${group.lines.map(lineHTML).join("")}
+          </div>`).join("");
+
+    return `
+        <div class="question-card is-multifield">
+          <div class="question-inner">
+            <div class="question-kicker"><span>看中文 · 写英文和变形</span>${questionTagsHTML(item)}</div>
+            <div class="prompt-meaning">${meaning ? posMeaning(meaning) : "暂无释义"}</div>
+            <div class="prompt-sub">先写原词，再按词性写变形 · 过去式/过去分词、比较级/最高级各占两个空 · 有一空写错，整题算错</div>
+            <div class="prompt-tools">
+              <button class="audio-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker} 听发音</button>
+              <button class="ghost-chip" type="button" data-skip-forms>只写原词</button>
+            </div>
+            <div class="dict-fields">
+              ${fieldHTML("原词", 0, "is-base")}
+              ${groupRows}
+            </div>
+            <div class="answer-row ${kb ? "is-soft" : ""}">
+              ${kb ? "" : '<button class="primary-btn" type="button" data-submit>提交</button>'}
+              <button class="ghost-btn" type="button" data-hint>提示</button>
+              <button class="ghost-btn reveal-btn" type="button" data-reveal>不会</button>
+            </div>
+            <div class="hint-text" id="hintText"></div>
+            ${kb ? softKeyboardHTML() : ""}
+          </div>
+        </div>`;
   }
 
   function questionHTML(item) {
     const session = ui.session;
     const entry = item.word;
+    if (session.mode === "form") {
+      const form = item.form || { label: "变形", value: "" };
+      // 上传/导入的词条常常没有释义，题目里就用离线词典的释义兜底。
+      const dictRow = state.dict && state.dict[entry.w];
+      const meaning = entry.m && entry.m !== "暂无释义"
+        ? entry.m
+        : ((dictRow && dictRow[1]) || entry.m || "");
+      return `
+        <div class="question-card">
+          <div class="question-inner">
+            <div class="question-kicker"><span>词形变化 · 写变形</span>${questionTagsHTML(item)}</div>
+            <div class="form-base">
+              <strong>${esc(entry.w)}</strong>
+              ${entry.p ? `<small>/${esc(entry.p)}/</small>` : ""}
+            </div>
+            <div class="form-ask">写出它的 <em>${esc(form.label)}</em></div>
+            <div class="form-meaning">${meaning ? posMeaning(cleanDictationMeaning(meaning)) : "暂无释义"}</div>
+            <div class="prompt-tools">
+              <button class="audio-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker} 听原词</button>
+            </div>
+            ${spellingInputHTML()}
+          </div>
+        </div>`;
+    }
+    if (item.form) return dictationFormHTML(item);
     if (session.mode === "zh2en") {
+      // 新版听写：原词 + 分行的变形都在同一张卡片里。
+      if (isMultiFieldItem(item)) return multiFieldDictationHTML(item);
+      // 只写原词时保留切回入口，避免学生一点「只写原词」就再也回不来。
+      const canToggleForms = Boolean(!item.form && Array.isArray(item.formGroups) && item.formGroups.length);
       return `
         <div class="question-card">
           <div class="question-inner">
             <div class="question-kicker"><span>看中文 · 写英文</span>${questionTagsHTML(item)}</div>
-            <div class="prompt-meaning">${posMeaning(entry.m)}</div>
-            <div class="prompt-sub">写出对应的英文单词</div>
+            <div class="prompt-meaning">${posMeaning(cleanDictationMeaning(entry.m))}</div>
+            <div class="prompt-sub">写出对应的英文单词${canToggleForms ? " · 也可以做词形变化拼写" : ""}</div>
             <div class="prompt-tools">
               <button class="audio-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker} 听发音</button>
+              ${canToggleForms ? '<button class="ghost-chip" type="button" data-skip-forms>词形变化拼写</button>' : ""}
               <button class="ghost-chip" type="button" data-handwriting>${ICONS.pencil} 手写板</button>
             </div>
-            <div class="word-slots" id="wordSlots" aria-label="请写出这个单词"><span class="slots-line"></span></div>
+            <div class="word-slots" id="wordSlots" aria-label="请写出这个单词"></div>
             <input class="answer-input ${useSoftKeyboard() ? "is-soft" : ""}" id="answerInput" type="text"
               inputmode="${useSoftKeyboard() && isTouchDevice() ? "none" : "text"}"
               ${useSoftKeyboard() && isTouchDevice() ? "readonly" : ""}
@@ -6318,11 +6849,24 @@
     const meta = ROUND_META[round.key] || ROUND_META.single;
     const number = roundNumberFor(session, round);
     const count = round.items.length;
+    // 新版一题里带多行变形，所以统计的是「行数」而不是「题数」。
+    const formCount = round.items.reduce(
+      (total, item) => total + (item.form ? 1 : itemFormLines(item).length), 0
+    );
     let hint = meta.hint;
-    if (round.key === "new") hint = `今天 ${count} 个新词，先过一遍`;
-    else if (round.key === "wrong") hint = `刚才写错的 ${count} 个词，再写一遍`;
-    else if (round.key === "review") hint = `${count} 个到期的旧词，看看还记得多少`;
-    else if (round.key === "free") hint = `${count} 个学过的词，随便练练`;
+    if (round.key === "new") {
+      if (formCount) hint = `今天 ${count} 个新词，每个词下面还有 ${formCount} 个变形空`;
+      else if (store.settings.dictateForms === false) hint = `今天 ${count} 个新词，只写原词 · 变形听写已关闭`;
+      else hint = `今天 ${count} 个新词，这批词没有变形`;
+    } else if (round.key === "wrong") {
+      hint = formCount
+        ? `刚才写错的 ${count} 个词，连同 ${formCount} 个变形空再写一遍`
+        : `刚才写错的 ${count} 个词，再写一遍`;
+    } else if (round.key === "review") {
+      hint = formCount
+        ? `${count} 个到期的旧词，连同 ${formCount} 个变形空`
+        : `${count} 个到期的旧词，看看还记得多少`;
+    } else if (round.key === "free") hint = `${count} 个学过的词，随便练练`;
     return `
       <div class="round-notice is-${escAttr(round.key)}">
         <span class="round-badge">第 ${number} 轮</span>
@@ -6334,16 +6878,15 @@
   }
 
   // 第 1 轮写错的词单独凑成第 2 轮，不插到新词里面。
-  function wrongRoundItems(session, round) {
-    const items = [];
-    const seen = new Set();
-    for (const item of round.items) {
-      const word = item.word && item.word.w;
-      if (!word || seen.has(word) || !session.wrongSet.has(word)) continue;
-      seen.add(word);
-      items.push({ word: item.word, isNew: false, bookId: item.bookId || session.bookId });
-    }
-    return items;
+  function wrongRoundItems(session) {
+    return (session.wrongItems || []).map(({ word, bookId, form, formGroups, skipForms }) => ({
+      word,
+      isNew: false,
+      bookId: bookId || session.bookId,
+      form,
+      formGroups,
+      skipForms,
+    }));
   }
 
   function hasMoreRounds(session) {
@@ -6360,7 +6903,7 @@
     const round = currentRound(session);
     if (round && round.key === "new" && !session.wrongRoundReady) {
       session.wrongRoundReady = true;
-      const items = wrongRoundItems(session, round);
+      const items = wrongRoundItems(session);
       if (items.length) {
         session.rounds.splice(session.roundIndex + 1, 0, { key: "wrong", items });
       } else if (session.rounds.some((item) => item.key === "review" && item.items.length)) {
@@ -6402,11 +6945,20 @@
     session.hintUsed = false;
     const body = $("#sessionBody");
     body.innerHTML = `${roundNoticeHTML(session)}${questionHTML(item)}`;
+    // 「只写原词」和多行听写来回切时，已经写进去的内容不能丢。
+    if (isMultiFieldItem(item) && Array.isArray(item.draftFields)) {
+      $$("[data-field]", body).forEach((field, index) => {
+        field.value = item.draftFields[index] || "";
+      });
+    } else if (typeof item.draftAnswer === "string") {
+      const answer = $("#answerInput");
+      if (answer) answer.value = item.draftAnswer;
+    }
     session.showRoundNotice = false;
     body.scrollTop = 0;
     updateSessionHeader();
 
-    if (session.mode === "zh2en" && !isTouchDevice()) {
+    if (session.mode !== "en2zh" && !isTouchDevice()) {
       setTimeout(() => {
         const input = $("#answerInput");
         if (input) input.focus({ preventScroll: true });
@@ -6424,6 +6976,39 @@
   function submitSpelling() {
     const session = ui.session;
     if (!session || session.answered) return;
+    const item = session.queue[session.index];
+
+    // 多输入行：原词 + 每一行变形一起判，任何一行写错整题算错。
+    if (isMultiFieldItem(item) && session.mode === "zh2en") {
+      const fields = $$("[data-field]", $("#sessionBody"));
+      if (!fields.length) return;
+      const lines = itemFormLines(item);
+      const results = [];
+      for (const field of fields) {
+        const value = field.value.trim();
+        if (!value) {
+          toast("每一行都要写，写完再提交");
+          field.focus();
+          return;
+        }
+        const index = Number(field.dataset.field);
+        const line = index > 0 ? lines[index - 1] : null;
+        const ok = index === 0
+          ? isCorrectAnswer(value, item.word.w)
+          : isCorrectFormAnswer(value, line ? line.form : null);
+        results.push({
+          label: index === 0 ? "原词" : (line ? line.label : "变形"),
+          expected: line ? line.target : item.word.w,
+          input: value,
+          ok,
+        });
+      }
+      session.fieldResults = results;
+      const wrongOne = results.find((result) => !result.ok);
+      handleAnswer(results.every((result) => result.ok), wrongOne ? wrongOne.input : "", null);
+      return;
+    }
+
     const input = $("#answerInput");
     if (!input) return;
     const value = input.value.trim();
@@ -6432,8 +7017,10 @@
       input.focus();
       return;
     }
-    const entry = session.queue[session.index].word;
-    handleAnswer(isCorrectAnswer(value, entry.w), value, null);
+    const correct = item.form
+      ? isCorrectFormAnswer(value, item.form)
+      : isCorrectAnswer(value, item.word.w);
+    handleAnswer(correct, value, null);
   }
 
   function chooseOption(index) {
@@ -6449,25 +7036,52 @@
   function showHint() {
     const session = ui.session;
     if (!session || session.answered) return;
-    const entry = session.queue[session.index].word;
+    const item = session.queue[session.index];
+    if (isMultiFieldItem(item) && session.mode === "zh2en") {
+      session.hintUsed = true;
+      const hint = $("#hintText");
+      if (hint) {
+        const lines = [{ label: "原词", target: item.word.w }].concat(
+          itemFormLines(item).map((line) => ({ label: line.label, target: line.target }))
+        );
+        hint.textContent = "提示：" + lines.map((line) => {
+          const pattern = Array.from(line.target).map((char, index) =>
+            (index === 0 ? char : /[a-z]/i.test(char) ? "·" : char)).join("");
+          return `${line.label} ${pattern}（${line.target.replace(/[^a-z]/gi, "").length} 字母）`;
+        }).join(" · ");
+      }
+      return;
+    }
+    const target = item.form ? item.form.value : item.word.w;
     session.hintUsed = true;
     const hint = $("#hintText");
     if (hint) {
-      const pattern = Array.from(entry.w).map((char, index) => (index === 0 ? char : /[a-z]/i.test(char) ? "·" : char)).join(" ");
-      hint.textContent = `提示：${pattern} · 共 ${entry.w.replace(/[^a-z]/gi, "").length} 个字母`;
+      const pattern = Array.from(target).map((char, index) => (index === 0 ? char : /[a-z]/i.test(char) ? "·" : char)).join(" ");
+      hint.textContent = `提示：${pattern} · 共 ${target.replace(/[^a-z]/gi, "").length} 个字母`;
     }
     // 字母数 / 字母格默认不显示，点“提示”后才出现。
     const slots = $("#wordSlots");
-    if (slots) slots.innerHTML = slotsHTML(entry.w);
+    if (slots) slots.innerHTML = slotsHTML(target);
   }
 
   function revealAnswer() {
     const session = ui.session;
-    if (!session || session.answered || session.mode !== "zh2en") return;
-    const entry = session.queue[session.index].word;
+    if (!session || session.answered || session.mode === "en2zh") return;
+    const item = session.queue[session.index];
+    if (isMultiFieldItem(item) && session.mode === "zh2en") {
+      const fields = $$("[data-field]", $("#sessionBody"));
+      const targets = [item.word.w].concat(itemFormLines(item).map((line) => line.target));
+      fields.forEach((field, index) => {
+        field.value = targets[index] || "";
+        field.disabled = true;
+      });
+      handleAnswer(false, "", null, true);
+      return;
+    }
+    const target = item.form ? item.form.value : item.word.w;
     const input = $("#answerInput");
     if (input) {
-      input.value = entry.w;
+      input.value = target;
       input.disabled = true;
     }
     handleAnswer(false, "", null, true);
@@ -6490,6 +7104,8 @@
 
     const progress = progressFor(bookId);
     const isNew = !progress[entry.w];
+    // 变形题只考词形，不替这个词本身记「学会」，也不占今天的新词额度。
+    const formDrill = Boolean(item.form);
     let record = progress[entry.w];
     if (!record) {
       record = {
@@ -6505,8 +7121,10 @@
         mastered: false,
       };
       progress[entry.w] = record;
-      session.newCount += 1;
-      today.newByBook[bookId] = (today.newByBook[bookId] || 0) + 1;
+      if (!formDrill) {
+        session.newCount += 1;
+        today.newByBook[bookId] = (today.newByBook[bookId] || 0) + 1;
+      }
     }
 
     const now = Date.now();
@@ -6519,9 +7137,11 @@
     if (isCorrect) {
       record.correct = (record.correct || 0) + 1;
       record.rightStreak = (record.rightStreak || 0) + 1;
-      record.level = Math.min(5, (record.level || 0) + 1);
-      record.due = now + REVIEW_DAYS[record.level] * DAY;
-      if (record.level >= 5) record.mastered = true;
+      if (!formDrill) {
+        record.level = Math.min(5, (record.level || 0) + 1);
+        record.due = now + REVIEW_DAYS[record.level] * DAY;
+        if (record.level >= 5) record.mastered = true;
+      }
       session.correct += 1;
       today.correct += 1;
       store.totals.correct += 1;
@@ -6537,13 +7157,30 @@
       const picked = session.mode === "en2zh"
         ? String(session.lastPickedWord || "")
         : String(userAnswer || "");
+      const wrongField = (session.fieldResults || []).find((result) => !result.ok);
       record.lastWrong = {
         input: revealed ? "" : picked.trim().slice(0, 40),
         mode: session.mode,
         at: now,
         revealed: Boolean(revealed),
+        expected: formDrill && item.form ? item.form.value : (wrongField ? wrongField.expected : ""),
+        label: formDrill && item.form ? item.form.label : (wrongField ? wrongField.label : ""),
       };
       session.wrongSet.add(entry.w);
+      // 错词重写要按「词 + 变形」记：写错 paid 就重写 paid，而不是再听写一遍 pay。
+      const wrongKey = `${entry.w}|${item.form ? item.form.key : ""}`;
+      if (!session.wrongKeys) session.wrongKeys = new Set();
+      if (!session.wrongKeys.has(wrongKey)) {
+        session.wrongKeys.add(wrongKey);
+        if (!session.wrongItems) session.wrongItems = [];
+        session.wrongItems.push({
+          word: entry,
+          bookId,
+          form: item.form,
+          formGroups: item.formGroups,
+          skipForms: item.skipForms,
+        });
+      }
       // 第 1 轮写错的词不插队重写，留到下一轮「错词重写」；其它轮按各自的次数插队。
       const roundKey = currentRoundKey(session);
       const retryLimit = ROUND_RETRY_LIMIT[roundKey] === undefined ? 2 : ROUND_RETRY_LIMIT[roundKey];
@@ -6556,6 +7193,9 @@
           retryCount: retryCount + 1,
           bookId: item.bookId,
           round: roundKey,
+          form: item.form,
+          formGroups: item.formGroups,
+          skipForms: item.skipForms,
         };
         const position = Math.min(session.index + 3, session.queue.length);
         session.queue.splice(position, 0, retryItem);
@@ -6566,7 +7206,7 @@
     updateWrongDot();
     playFeedback(isCorrect);
 
-    if (session.mode === "zh2en") {
+    if (session.mode !== "en2zh") {
       const input = $("#answerInput");
       if (input) input.disabled = true;
       $$("[data-submit], [data-hint], [data-handwriting], [data-reveal]", $("#sessionBody")).forEach((el) => { el.disabled = true; });
@@ -6614,14 +7254,47 @@
       ? `<div class="your-answer">${session.mode === "en2zh" ? "你的选择" : "你的答案"}：<s>${esc(userAnswer)}</s></div>`
       : "";
 
+    const item = session.queue[session.index];
+    const formLine = item.form
+      ? `<div class="feedback-form"><span>${esc(item.form.label)}</span><strong>${formValueHTML(item.form)}</strong></div>`
+      : "";
+    const fieldResults = session.fieldResults || [];
+    const fieldResultHTML = fieldResults.length
+      ? `<div class="dict-results">${fieldResults.map((result) => `
+          <div class="dict-result ${result.ok ? "is-ok" : "is-bad"}">
+            <span>${esc(result.label)}</span>
+            <strong>${esc(result.expected)}</strong>
+            <em>${result.ok ? "✓" : "×"}</em>
+          </div>`).join("")}</div>`
+      : "";
+    const morphBlock = fieldResults.length ? "" : (session.mode === "form" || item.form
+      ? morphBlockHTML(entry.w, entry.m, { practice: false })
+      : morphLineHTML(entry.w, entry.m));
+    // 开关关掉时，反馈里仍然会列出变形，很容易让人以为「只显示不考」。
+    // 这里直接给个开启入口，把「为什么没出变形题」当场解释清楚。
+    const hiddenForms = !item.form && session.mode === "zh2en" && store.settings.dictateForms === false
+      ? dictatedForms(entry.w, entry.m)
+      : [];
+    const formsOffHint = hiddenForms.length
+      ? `<button class="morph-off-hint" type="button" data-enable-forms>听写变形已关闭 · 点此开启，下次接着考 ${hiddenForms.map((form) => esc(form.value)).join(" / ")}</button>`
+      : "";
+
     const roundDone = session.index + 1 >= session.queue.length;
     const nextLabel = !roundDone ? "下一题" : hasMoreRounds(session) ? "进入下一轮" : "查看结果";
+    const answerLabel = item.form ? "变形" : "";
+    const headText = isCorrect
+      ? (answerLabel ? `${answerLabel}答对了` : isNew ? "新词答对了" : "答对了")
+      : revealed
+        ? "看过答案，再记一遍"
+        : answerLabel
+          ? `${answerLabel}写错了，看看正确形式`
+          : "答错了，看看正确答案";
 
     const feedback = `
       <div class="feedback ${isCorrect ? "correct" : "wrong"}" id="feedback">
         <div class="feedback-head">
           <span class="feedback-icon">${isCorrect ? "✓" : "×"}</span>
-          <span>${isCorrect ? (isNew ? "新词答对了" : "答对了") : revealed ? "看过答案，再记一遍" : "答错了，看看正确答案"}</span>
+          <span>${esc(headText)}</span>
           <span class="feedback-score">${points > 0 ? `+${points}` : "已记入错词"}</span>
         </div>
         <div class="feedback-personal">${personalButtonHTML(entry.w)}</div>
@@ -6631,7 +7304,11 @@
           <button class="mini-btn" type="button" data-speak="${escAttr(entry.w)}">${ICONS.speaker}</button>
         </div>
         <div class="feedback-meaning">${posMeaning(entry.m)}</div>
+        ${formLine}
         ${yourAnswer}
+        ${fieldResultHTML}
+        ${morphBlock}
+        ${formsOffHint}
         ${example}
         <div class="answer-actions">
           <button class="primary-btn" type="button" data-next>${nextLabel}</button>
@@ -6653,6 +7330,7 @@
     const session = ui.session;
     if (!session || !session.answered) return;
     session.index += 1;
+    session.fieldResults = null;
     // 这一轮答完就换下一轮；最后一轮答完才出结果。
     if (session.index >= session.queue.length) {
       advanceRound();
@@ -6755,6 +7433,12 @@
     ui.session = null;
     $("#session").hidden = true;
     document.body.classList.remove("session-open");
+    // 练习中收到的「新版本」留到这里再刷新，免得答题答到一半被打断。
+    if (ui.swReloadPending) {
+      toast("新版本已生效，正在刷新…");
+      setTimeout(() => location.reload(), 500);
+      return;
+    }
     renderCurrent();
   }
 
@@ -6763,11 +7447,17 @@
     if (!session) return;
     const items = [];
     const seen = new Set();
-    for (const item of sessionItems(session)) {
-      const word = item.word.w;
-      if (!session.wrongSet.has(word) || seen.has(word)) continue;
-      seen.add(word);
-      items.push({ entry: item.word, bookId: item.bookId || session.bookId });
+    for (const row of (session.wrongItems || [])) {
+      const key = `${row.word.w}|${row.form ? row.form.key : ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({
+        entry: row.word,
+        bookId: row.bookId || session.bookId,
+        form: row.form,
+        formGroups: row.formGroups,
+        skipForms: row.skipForms,
+      });
     }
     if (!items.length) {
       toast("这次没有错词");
@@ -6832,14 +7522,14 @@
 
       const params = new URLSearchParams(location.search);
       const mode = params.get("mode");
-      if (mode === "zh2en" || mode === "en2zh") {
+      if (mode === "zh2en" || mode === "en2zh" || mode === "form") {
         history.replaceState(null, "", location.pathname + location.hash);
       }
 
       ensureCurrentBook()
         .then((book) => {
           loadDict().catch((error) => console.warn("Dictionary will load on demand", error));
-          if (mode === "zh2en" || mode === "en2zh") {
+          if (mode === "zh2en" || mode === "en2zh" || mode === "form") {
             window.setTimeout(() => startSession(mode), 180);
           }
           return book;
@@ -6862,6 +7552,10 @@
 
   function handleServiceWorkerMessage(event) {
     const data = event.data || {};
+    if (data.type === "APP_UPDATED") {
+      applyPendingUpdate();
+      return;
+    }
     if (data.type === "OFFLINE_PROGRESS") {
       ui.swReady = true;
       ui.offlineProgress = Number(data.done) || 0;
@@ -6922,11 +7616,29 @@
     }
   }
 
+  // 新版本装上后直接接管；不在练习中时自动刷新，免得装在主屏幕后一直跑旧缓存。
+  function applyPendingUpdate() {
+    if (ui.swReloadPending) return;
+    ui.swReloadPending = true;
+    if (ui.session) {
+      toast("新版本已就绪，这一组练完会自动更新");
+      return;
+    }
+    toast("新版本已生效，正在刷新…");
+    setTimeout(() => location.reload(), 700);
+  }
+
   async function registerServiceWorker() {
     if (location.protocol === "file:" || !("serviceWorker" in navigator)) return;
     try {
+      // 首次安装时 clients.claim() 也会触发 controllerchange，那次不该刷新页面。
+      const hadController = Boolean(navigator.serviceWorker.controller);
       const registration = await navigator.serviceWorker.register("sw.js", { scope: "./" });
       navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (!hadController) return;
+        applyPendingUpdate();
+      });
       navigator.serviceWorker.ready.then(() => {
         ui.swReady = true;
         if (ui.tab === "settings") renderSettings();
@@ -6936,11 +7648,15 @@
         const worker = registration.installing;
         if (!worker) return;
         worker.addEventListener("statechange", () => {
-          if (worker.state === "installed" && navigator.serviceWorker.controller) {
-            toast("新版本已准备好，重新打开后生效");
-          }
+          if (worker.state !== "installed") return;
+          // 没有 controller 说明是第一次安装，不用提醒也不要刷新。
+          if (!navigator.serviceWorker.controller) return;
+          // 主动接管，页面收到 controllerchange 后会自己刷新。
+          worker.postMessage({ type: "SKIP_WAITING" });
         });
       });
+      // 每次启动都问一次，别等浏览器 24 小时才自动检查。
+      registration.update().catch(() => {});
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible" && !ui.offlineReady) requestOfflineCache();
       });
@@ -7112,6 +7828,16 @@
         renderWrong();
         return;
       }
+      const wrongSortBtn = target.closest("[data-wrong-sort]");
+      if (wrongSortBtn) {
+        const next = wrongSortBtn.dataset.wrongSort;
+        if (WRONG_SORTS.some((sort) => sort.id === next)) {
+          store.settings.wrongSort = next;
+          saveStore();
+          renderWrong();
+        }
+        return;
+      }
       const wrongMode = target.closest("[data-wrong-mode]");
       if (wrongMode) {
         // 练当前选中的范围（某一本或所有），每条带上自己的词库。
@@ -7163,16 +7889,23 @@
       if (toggle) {
         const key = toggle.dataset.toggle;
         if (key === "autoSpeak") store.settings.autoSpeak = !store.settings.autoSpeak;
+        else if (key === "dictateForms") {
+          store.settings.dictateForms = store.settings.dictateForms === false;
+          toast(store.settings.dictateForms !== false
+            ? "已开启：听写时会接着考不规则变形"
+            : "已关闭：只听写原词，变形只在查词页显示");
+        }
         else if (key === "sound") store.settings.sound = !store.settings.sound;
         else if (key === "softKeyboard") {
           store.settings.softKeyboard = !store.settings.softKeyboard;
-          if (ui.session && ui.session.mode === "zh2en" && !ui.session.answered) {
+          if (ui.session && ui.session.mode !== "en2zh" && !ui.session.answered) {
             const input = $("#answerInput");
             if (input) input.value = "";
           }
         }
         saveStore();
-        renderSettings();
+        // 首页也有这个开关（听写变形状态条），所以不能只刷设置页。
+        renderCurrent();
         return;
       }
       const actionButton = target.closest("[data-action]");
@@ -7196,6 +7929,7 @@
         }
         else if (action === "cache-offline") requestOfflineCache(true);
         else if (action === "update") checkUpdate();
+        else if (action === "hard-reload") hardReload();
         else if (action === "upload-file") openUploadPicker();
         else if (action === "manage-upload") openUploadManageSheet();
         return;
@@ -7204,8 +7938,38 @@
 
     $("#sessionBody").addEventListener("click", (event) => {
       const target = event.target;
+      // 反馈页那个「变形听写已关闭」的补救按钮，点了当场开启。
+      const enableForms = target.closest("[data-enable-forms]");
+      if (enableForms) {
+        store.settings.dictateForms = true;
+        saveStore();
+        enableForms.disabled = true;
+        enableForms.textContent = "已开启，下一组练习就会接着考";
+        toast("已开启：下一组练习会接着考不规则变形");
+        return;
+      }
       if (target.closest("[data-submit]")) {
         submitSpelling();
+        return;
+      }
+      const skipForms = target.closest("[data-skip-forms]");
+      if (skipForms) {
+        const current = ui.session && ui.session.queue[ui.session.index];
+        if (current && !ui.session.answered) {
+          // 切换前后都把手写内容存下来，来回切不会清空输入框。
+          const fields = $$("[data-field]", $("#sessionBody"));
+          if (fields.length) {
+            current.draftFields = fields.map((field) => field.value);
+            current.draftAnswer = current.draftFields[0] || "";
+          } else {
+            const answer = $("#answerInput");
+            current.draftAnswer = answer ? answer.value : "";
+            current.draftFields = current.draftAnswer ? [current.draftAnswer] : [];
+          }
+          current.skipForms = !current.skipForms;
+          renderSession();
+          toast(current.skipForms ? "这一题只写原词" : "词形变化拼写已开启");
+        }
         return;
       }
       if (target.closest("[data-personal-toggle]")) {
@@ -7266,7 +8030,9 @@
         nextQuestion();
         return;
       }
-      if (event.target && event.target.id === "answerInput") {
+      const typing = event.target && (event.target.id === "answerInput"
+        || (typeof event.target.matches === "function" && event.target.matches("[data-field]")));
+      if (typing) {
         event.preventDefault();
         // 这一下只负责“提交并显示答案”。如果不拦住冒泡，document 上的
         // Enter 处理会紧接着看到 answered=true，又跳到下一题。
@@ -7284,6 +8050,13 @@
       }
       if (target.closest("[data-data-export]")) {
         exportData(selectedScopes());
+        return;
+      }
+      const practiceButton = target.closest("[data-practice-forms]");
+      if (practiceButton) {
+        const word = practiceButton.dataset.practiceForms;
+        const lookup = ui.currentLookup && ui.currentLookup.base === word ? ui.currentLookup : null;
+        startFormPractice(word, lookup ? lookup.entry : null);
         return;
       }
       if (target.closest("[data-data-import]")) {

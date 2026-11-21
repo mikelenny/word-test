@@ -864,6 +864,82 @@ svg {
   text-align: center;
 }
 
+/* 首页那行「听写顺带特殊变形」状态胶囊，点一下就能开关。 */
+.forms-flag {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: 100%;
+  margin: 8px auto 0;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+
+.forms-flag-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.45;
+  flex: none;
+}
+
+.forms-flag.is-on {
+  color: var(--accent-deep);
+  background: var(--accent-soft);
+  border-color: rgba(47, 107, 80, 0.16);
+}
+
+.forms-flag.is-on .forms-flag-dot {
+  opacity: 1;
+}
+
+.forms-flag.is-off {
+  color: var(--amber-deep);
+  background: var(--amber-soft);
+  border-color: rgba(138, 90, 18, 0.16);
+}
+
+.forms-flag.is-off .forms-flag-dot {
+  opacity: 0.9;
+}
+
+/* 反馈页里「变形听写已关闭」的补救按钮 */
+.morph-off-hint {
+  display: block;
+  width: 100%;
+  margin: 8px 0 0;
+  padding: 9px 12px;
+  border: 1px dashed var(--amber);
+  border-radius: var(--radius-md);
+  background: var(--amber-soft);
+  color: var(--amber-deep);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.morph-off-hint:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
+.morph-off-hint:not(:disabled):active {
+  transform: scale(0.99);
+}
+
 .wrong-teaser {
   display: flex;
   align-items: center;
@@ -2586,6 +2662,11 @@ svg {
   font-size: 9px;
 }
 
+.question-kicker .form-tag {
+  color: var(--accent-deep);
+  background: var(--accent-soft);
+}
+
 .lib-tag {
   letter-spacing: 0.02em;
   padding: 3px 7px;
@@ -2738,7 +2819,10 @@ svg {
   color: var(--muted);
 }
 
-/* 听写默认只显示一条横线，字母格（含字母数）在点“提示”后才出现 */
+/* 听写的原词输入框自带边线，不再在上方画一条多余的横线；点“提示”后字母格仍会出现 */
+.word-slots:empty { display: none; }
+
+/* 词形变化练习仍保留默认横线，字母格在点“提示”后才出现 */
 .word-slots .slots-line {
   display: block;
   width: 64%;
@@ -4600,4 +4684,369 @@ body.sheet-open {
 
 .data-actions .mini-btn.danger {
   background: var(--red-soft);
+}
+
+/* ---------------- 词形变化（v1.9.0） ---------------- */
+.mode-card.form {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  min-height: 64px;
+  background:
+    radial-gradient(220px 120px at 100% 0%, rgba(112, 80, 142, 0.10), transparent 70%),
+    var(--card);
+  border: 1.5px dashed rgba(63, 95, 138, 0.32);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.mode-card.form .mode-icon {
+  background: rgba(63, 95, 138, 0.12);
+  color: var(--blue);
+}
+
+.mode-card.form small {
+  margin: 0 0 0 auto;
+  padding-left: 0;
+  max-width: 58%;
+  text-align: right;
+  color: var(--muted);
+}
+
+.form-base {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.form-base strong {
+  font-family: var(--font-serif);
+  font-size: clamp(32px, 9vw, 46px);
+  font-weight: 600;
+  line-height: 1.12;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.form-base small {
+  color: var(--faint);
+  font-size: 13px;
+}
+
+.form-ask {
+  margin-top: 10px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.form-ask em {
+  margin-left: 3px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-style: normal;
+  font-weight: 700;
+}
+
+/* 听写里的变形题：中文释义在上，下面点名「pay 的过去式」。 */
+.form-ask strong {
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.form-ask small {
+  margin-left: 5px;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+/* 多行听写卡片：第一行原词，下面按词性一行一个变形 */
+.dict-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.dict-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dict-field-label {
+  flex: 0 0 120px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.dict-field.is-base .dict-field-label {
+  color: var(--accent-deep);
+  font-weight: 700;
+}
+
+.dict-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 46px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--ink);
+  font-family: var(--font-serif);
+  font-size: 17px;
+  text-align: left;
+  box-shadow: none;
+}
+
+.dict-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.dict-group {
+  margin-top: 4px;
+  padding: 10px 11px 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--card-soft);
+}
+
+.dict-group-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 9px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.dict-pos {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 10px;
+}
+
+/* 过去式/过去分词、比较级/最高级：左边统一行名，右边两个空并排 */
+.dict-line.is-pair {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dict-pair-fields {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dict-pair-fields .dict-input {
+  /* 只补 grid 里的宽度，高度/字号/边框全部继承 .dict-input，和其它空完全一致 */
+  width: 100%;
+}
+
+.dict-results {
+  display: grid;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--card-soft);
+}
+
+.dict-result {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.dict-result span { flex: 0 0 92px; color: var(--muted); }
+.dict-result strong { flex: 1; font-family: var(--font-serif); font-size: 14px; }
+.dict-result em { font-style: normal; font-weight: 700; }
+.dict-result.is-ok strong, .dict-result.is-ok em { color: var(--accent); }
+.dict-result.is-bad strong, .dict-result.is-bad em { color: var(--red); }
+
+.form-meaning {
+  margin-top: 9px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--faint);
+}
+
+.morph-block {
+  margin: 12px 0 2px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--card-soft);
+}
+
+.morph-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.morph-head strong {
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+}
+
+.morph-head small {
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
+.morph-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.morph-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 253, 247, 0.92);
+  font-size: 12px;
+}
+
+.morph-item em {
+  color: var(--faint);
+  font-size: 10.5px;
+  font-style: normal;
+}
+
+.morph-item strong {
+  color: var(--ink-soft);
+  font-weight: 700;
+}
+
+.morph-item.is-irregular {
+  border-color: rgba(189, 77, 63, 0.24);
+  background: var(--red-soft);
+}
+
+.morph-item.is-irregular em {
+  color: #9a5c52;
+}
+
+.morph-item.is-irregular strong {
+  color: var(--red);
+}
+
+.morph-practice {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 6px 11px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent-deep);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.morph-practice svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.morph-line {
+  margin-top: 9px;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.morph-line span {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.feedback-form {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+}
+
+.feedback-form span {
+  color: var(--accent-deep);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.feedback-form strong {
+  color: var(--accent-deep);
+  font-size: 15px;
+}
+
+/* 错词排序 */
+.wrong-sorts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 2px 12px;
+}
+
+.wrong-sorts-label {
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.wrong-sort {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.wrong-sort.is-active {
+  border-color: rgba(47, 107, 80, 0.35);
+  background: var(--accent-soft);
+  color: var(--accent-deep);
 }
